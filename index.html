@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>x64emu - an x86-64 emulator in WebAssembly text format</title>
+<style>
+  :root {
+    --bg: #10131a;
+    --panel: #171b24;
+    --edge: #272d3a;
+    --ink: #d6dbe6;
+    --dim: #79839a;
+    --accent: #6fd3a0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); padding: 14px; }
+  h1 { font-size: 15px; margin: 0 0 2px; font-weight: 600; }
+  .sub { font-size: 12px; color: var(--dim); margin-bottom: 12px; }
+  .layout { display: grid; grid-template-columns: minmax(0,1fr) 290px; gap: 12px; }
+  @media (max-width: 940px) { .layout { grid-template-columns: minmax(0,1fr); } }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 11px;
+  }
+  .panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 8px; font-weight: 600;
+  }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 9px; }
+  label { font-size: 12px; color: var(--dim); display: inline-flex; align-items: center; gap: 6px; }
+  input[type=text], input[type=number] {
+    background: #0d1016; color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 5px; padding: 5px 7px; font-size: 12px;
+    font-family: ui-monospace, Menlo, monospace;
+  }
+  input[type=text] { flex: 1 1 300px; min-width: 180px; }
+  input[type=number] { width: 72px; }
+  input[type=file] { font-size: 11px; color: var(--dim); max-width: 190px; }
+  button {
+    background: #222836; color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 5px; padding: 6px 12px; font-size: 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+
+  .screenwrap {
+    background: #000; border: 1px solid var(--edge); border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 420px; overflow: auto; padding: 6px;
+  }
+  #vga {
+    image-rendering: pixelated;
+    max-width: 100%;
+    outline: none;
+    display: block;
+  }
+  .screenwrap:focus-within { border-color: var(--accent); }
+
+  #serial {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 11.5px; line-height: 1.35;
+    background: #0a0c11; color: #cfe3d6;
+    border: 1px solid var(--edge); border-radius: 6px;
+    padding: 8px; height: 190px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word; margin: 9px 0 0;
+  }
+  #regs {
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+    line-height: 1.5; margin: 0; white-space: pre; color: #b8c2d4; overflow-x: auto;
+  }
+  .stat { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
+  .stat span:first-child { color: var(--dim); }
+  .stat span:last-child { font-family: ui-monospace, Menlo, monospace; }
+  /* A drive that is being read lights up; one that has gone quiet does not.
+     The distinction is the whole point -- a stalled boot and a slow one look
+     the same in the instruction counter. */
+  .lamp { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+          margin-right: 6px; background: #333; vertical-align: middle; }
+  .lamp.on { background: #4ade80; box-shadow: 0 0 5px #4ade80; }
+  .lamp.wait { background: #fbbf24; box-shadow: 0 0 5px #fbbf24; }
+  .note { font-size: 11px; color: var(--dim); line-height: 1.5; margin-top: 8px; }
+  code { background: #0d1016; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+  fieldset {
+    border: 1px solid var(--edge); border-radius: 6px; padding: 9px 10px 10px;
+    margin: 0 0 9px;
+  }
+  legend { font-size: 11px; color: var(--dim); padding: 0 5px; }
+</style>
+</head>
+<body>
+
+<h1>x64emu</h1>
+<div class="sub">An x86-64 CPU written in WebAssembly text format, with a VGA adapter, a virtual BIOS, and a JavaScript platform around it.</div>
+
+<div class="layout">
+  <div class="panel">
+    <fieldset>
+      <legend>Boot a disk image (BIOS boot: ISO, floppy, or hard disk)</legend>
+      <div class="controls">
+        <label>image <input type="file" id="imageFile"></label>
+        <label>as
+          <select id="imageKind" style="background:#0d1016;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:5px;font-size:12px">
+            <option value="auto">auto-detect</option>
+            <option value="cdrom">CD-ROM</option>
+            <option value="hdd">hard disk</option>
+            <option value="floppy">floppy</option>
+          </select>
+        </label>
+        <button id="bootImage" disabled>Boot image</button>
+      </div>
+      <div class="note" style="margin-top:0">
+        Images are read in pieces as the guest asks for them, so size is not
+        limited by memory.
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Memory hard drive (blank, writable, on ATA and INT 13h)</legend>
+      <div class="controls">
+        <label>size <input type="text" id="hddSize" value="8G" size="6"></label>
+        <span class="note" id="hddState" style="margin:0">not attached</span>
+        <button id="downloadHdd" disabled>Download image</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Or load a Linux kernel directly (no BIOS)</legend>
+      <div class="controls">
+        <label>kernel <input type="file" id="kernelFile"></label>
+        <label>initrd <input type="file" id="initrdFile"></label>
+        <button id="bootKernel" disabled>Boot kernel</button>
+      </div>
+      <div class="controls">
+        <label style="flex:1 1 300px">cmdline
+          <input type="text" id="cmdline" value="console=ttyS0,115200 loglevel=7 nokaslr">
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="controls">
+      <button id="pause" disabled>Pause</button>
+      <button id="stop">Stop</button>
+      <button id="grabKeys" class="on">Keyboard: display</button>
+      <label>RAM <input type="text" id="ram" value="256M" size="6"></label>
+      <label>zoom <input type="number" id="zoom" value="0" min="0" max="6" step="1" title="0 = fit to panel"></label>
+    </div>
+
+    <div class="screenwrap">
+      <canvas id="vga" width="720" height="400" tabindex="0"></canvas>
+    </div>
+
+    <pre id="serial">starting…</pre>
+    <div class="note">
+      Click the screen to capture the keyboard and mouse; Esc gives the mouse
+      back. The mouse is a PS/2 mouse on IRQ 12. Keys go to the emulated PS/2
+      controller and the BIOS keyboard buffer; with <b>Keyboard: serial</b> they
+      go to the UART on <code>ttyS0</code> instead.
+    </div>
+  </div>
+
+  <div>
+    <div class="panel" style="margin-bottom:12px">
+      <h2>Machine</h2>
+      <div class="stat"><span>state</span><span id="state">idle</span></div>
+      <div class="stat"><span>MIPS</span><span id="mips">0.0</span></div>
+      <div class="stat"><span>instructions</span><span id="instrs">0</span></div>
+      <div class="stat"><span>mode</span><span id="mode">-</span></div>
+      <div class="stat"><span>CPL</span><span id="cpl">-</span></div>
+      <div class="stat"><span>video</span><span id="video">-</span></div>
+      <div class="stat"><span>RAM</span><span id="ramStat">-</span></div>
+      <div class="stat"><span>disk used</span><span id="diskStat">-</span></div>
+      <div class="stat"><span>pixels lit</span><span id="litStat">-</span></div>
+      <div id="diskIo"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Registers</h2>
+      <pre id="regs">(not running)</pre>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="src/js/ui.js"></script>
+</body>
+</html>

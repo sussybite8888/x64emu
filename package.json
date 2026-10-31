@@ -1,0 +1,13 @@
+{
+  "name": "x64emu",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "./build.sh",
+    "test": "node tests/run.mjs && node tests/run_bios.mjs",
+    "boot": "node tools/boot.mjs",
+    "bootimg": "node tools/bootimg.mjs",
+    "bench": "node tools/bench.mjs",
+    "serve": "node tools/serve.mjs 8000"
+  }
+}
