@@ -11,7 +11,7 @@
 //  and 0x170 and IRQs 14 and 15 that the ATA controller already provides --
 //  and has no bus-master BAR, so drivers fall back to PIO, which is all there
 //  is.  Nothing here moves a device: BARs a guest writes are kept, and only
-//  their size bits are fixed.
+//  their size bits are fixed, until a reset puts back the power-on values.
 // ---------------------------------------------------------------------------
 
 class PciFunction {
@@ -37,6 +37,26 @@ class PciFunction {
     this.writable[0x0d] = 0xff;                  // latency timer
     this.writable[0x3c] = 0xff;                  // interrupt line
     for (const [reg, value] of Object.entries(init)) this.config[Number(reg)] = value;
+  }
+
+  /**
+   * A memory BAR at `base`, `size` bytes (a power of two).  The address bits
+   * are writable so a guest can size it the usual way -- write all ones, read
+   * back the mask -- and the low bits say what kind of memory it is.
+   */
+  memoryBar(index, base, size, prefetchable = false) {
+    const reg = 0x10 + index * 4;
+    const v = new DataView(this.config.buffer);
+    v.setUint32(reg, (base | (prefetchable ? 0x08 : 0)) >>> 0, true);
+    const mask = (~(size - 1)) >>> 0;
+    for (let i = 0; i < 4; i++) this.writable[reg + i] = (mask >>> (i * 8)) & 0xff;
+    this.writable[0x04] |= 0x02;                 // memory space enable
+    return this;
+  }
+
+  /** The address a BAR currently decodes, as the guest last set it. */
+  barAddress(index) {
+    return (new DataView(this.config.buffer).getUint32(0x10 + index * 4, true) & ~0xf) >>> 0;
   }
 
   /** Let the guest write a range of device-specific registers. */
@@ -79,7 +99,37 @@ export class PciBus {
     }).allowWrites(0x40, 0x4f));
   }
 
-  add(slot, fn, f) { this.functions.set((slot << 3) | fn, f); }
+  /** Plug in a function, fully set up: what it holds now is its power-on state. */
+  add(slot, fn, f) {
+    f.powerOn = f.config.slice();
+    this.functions.set((slot << 3) | fn, f);
+    return f;
+  }
+
+  /**
+   * RST#: every function's configuration back to power-on.  Without it a
+   * BAR or command register the previous system wrote outlives the reset,
+   * and the next one finds devices where its BIOS never put them.
+   */
+  reset() {
+    this.address = 0;
+    for (const f of this.functions.values()) f.config.set(f.powerOn);
+  }
+
+  /**
+   * 02.0  Cirrus Logic GD5446: BAR0 the framebuffer and BitBLT aperture,
+   * BAR1 the memory-mapped registers.  The subsystem IDs are QEMU's, which
+   * is what Linux's cirrus-qemu driver looks for; Windows ignores them.
+   */
+  addCirrus(fbBase, fbSize, mmioBase, mmioSize) {
+    const f = new PciFunction({
+      vendor: 0x1013, device: 0x00b8, classCode: 0x030000,
+      init: { 0x04: 0x03, 0x2c: 0xf4, 0x2d: 0x1a, 0x2e: 0x00, 0x2f: 0x11 },
+    });
+    f.memoryBar(0, fbBase, fbSize, true);
+    f.memoryBar(1, mmioBase, mmioSize);
+    return this.add(2, 0, f);
+  }
 
   /** The function the address register currently selects, if any. */
   selected() {

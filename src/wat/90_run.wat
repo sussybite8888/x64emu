@@ -403,7 +403,7 @@
   ;;  timestamp counter: a guest may write the TSC through WRMSR, and the loop
   ;;  bound must not depend on a value the guest controls.
   (func $run (param $budget i32) (result i32)
-    (local $n i32) (local $vec i32) (local $slot i32) (local $k i32)
+    (local $n i32) (local $vec i32) (local $slot i32) (local $k i32) (local $shadow i32)
     (global.set $exit_req (i32.const 0))
     (block $stop
       (loop $l
@@ -428,7 +428,14 @@
                   ;; Nothing deliverable: drop the line until the host raises
                   ;; it again, rather than asking on every instruction.
                   (else (i32.store (i32.const 0xD8) (i32.const 0))))))))
-        (if (i32.load (i32.const 0xDC))
+        ;; STI and MOV SS hold interrupts off for exactly one instruction.
+        ;; That instruction is interpreted on its own rather than as the start
+        ;; of a compiled block, so the interrupt check comes round again right
+        ;; after it.  "sti; nop; cli" is how VMM opens a window for pending
+        ;; interrupts, and running nop and cli together in one block closed it
+        ;; every time: Windows 95 waited forever for an event with IF clear.
+        (local.set $shadow (i32.load (i32.const 0xDC)))
+        (if (local.get $shadow)
           (then (i32.store (i32.const 0xDC) (i32.const 0))))
 
         (if (global.get $halted)
@@ -440,6 +447,7 @@
         ;; be wrong either way.
         (block $interp
           (br_if $interp (i32.eqz (global.get $jit_on)))
+          (br_if $interp (local.get $shadow))
           ;; Only branch targets are candidates, so straight-line interpreted
           ;; code pays one predictable branch and never touches the cache.
           (br_if $interp (i32.eqz (i32.or (global.get $jit_head)
@@ -447,11 +455,17 @@
           (global.set $jit_head (i32.const 0))
           (local.set $slot (call $jit_lookup))
           (br_if $interp (i32.eqz (local.get $slot)))
+          (global.set $jit_exit (i32.const 0))
+          (global.set $jit_budget (i32.sub (local.get $budget) (local.get $n)))
           (local.set $k (call_indirect $jit (type $jitblk)
                                        (i32.sub (local.get $slot) (i32.const 1))))
           ;; Wherever the block left off is itself a place worth looking up.
           (global.set $jit_head (i32.const 1))
-          (global.set $tsc_g (i64.add (global.get $tsc_g) (i64.extend_i32_u (local.get $k))))
+          ;; The block has already advanced the timestamp counter, so that the
+          ;; instructions it interprets along the way see it current.
+          (global.set $jit_blocks_run (i64.add (global.get $jit_blocks_run) (i64.const 1)))
+          (global.set $jit_instrs_run (i64.add (global.get $jit_instrs_run)
+                                               (i64.extend_i32_u (local.get $k))))
           (local.set $n (i32.add (local.get $n) (local.get $k)))
           (if (global.get $fault) (then (call $deliver_fault)))
           (if (global.get $exit_req) (then (br $stop)))
@@ -575,9 +589,23 @@
   (func (export "tlb_flush") (call $tlb_flush))
 
   ;; Route the 0xA0000 window through the host while a planar mode is active.
+  ;; 0 off; 1 the 64 KiB window at 0xA0000; 2 that and the SVGA's registers
+  ;; at 0xB8000 as well.
   (func (export "set_vga_mmio") (param $v i32)
     (global.set $vga_mmio (local.get $v))
-    (call $flush_addr_caches))
+    (global.set $vga_win_hi (select (i64.const 0xB8100) (i64.const 0xB0000)
+                                    (i32.eq (local.get $v) (i32.const 2))))
+    (call $flush_addr_caches)
+    ;; translations of the window were made under the old routing
+    (call $jtlb_flush_all))
+
+  ;; Route a range of RAM to the host (see $trap_lo).  Translations of it that
+  ;; were cached while it was plain memory have to go.
+  (func (export "set_trap") (param $lo i64) (param $hi i64)
+    (global.set $trap_lo (local.get $lo))
+    (global.set $trap_hi (local.get $hi))
+    (call $flush_addr_caches)
+    (call $jtlb_flush_all))
 
   ;; The A20 gate.  Cached translations were formed under the old mask, and
   ;; compiled blocks are keyed on them, so all of it goes.
@@ -617,13 +645,18 @@
     (i64.store (local.get $at) (global.get $rip_g))
     ;; one register travels with the address, which is what turns "the path ran
     ;; through here" into "and the pointer was already wrong by this point"
+    ;; Register number 16 means the linear address instead, for code whose
+    ;; CS base varies, where RIP alone does not say where it ran.
     (i64.store (i32.add (local.get $at) (i32.const 8))
-               (call $reg64 (global.get $trace_reg)))
+               (if (result i64) (i32.eq (global.get $trace_reg) (i32.const 16))
+                 (then (i64.add (global.get $cs_base) (global.get $rip_g)))
+                 (else (call $reg64 (global.get $trace_reg)))))
     (i32.store (i32.const 0x7000) (i32.add (i32.load (i32.const 0x7000)) (i32.const 1))))
 
   (func (export "set_trace") (param $on i32) (param $reg i32)
     (global.set $trace_on (local.get $on))
-    (global.set $trace_reg (i32.and (local.get $reg) (i32.const 15)))
+    (global.set $trace_reg (select (i32.const 16) (i32.and (local.get $reg) (i32.const 15))
+                                   (i32.eq (local.get $reg) (i32.const 16))))
     (i32.store (i32.const 0x7000) (i32.const 0)))
 
   (func (export "trace_reg") (param $i i32) (result i64)

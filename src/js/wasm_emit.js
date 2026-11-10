@@ -62,11 +62,30 @@ export class Func {
     this.results = results;
     this.locals = locals;          // extra locals, beyond the parameters
     this.code = [];
+    // Open structured blocks, so a branch can be aimed at a label by name
+    // rather than by a depth worked out by hand at every site.
+    this.depth = 0;
   }
 
   get localBase() { return this.params.length; }
 
-  emit(...bytes) { this.code.push(...bytes); return this; }
+  emit(...bytes) {
+    const c = this.code;
+    for (let i = 0; i < bytes.length; i++) c.push(bytes[i]);
+    return this;
+  }
+
+  /** Add a local of the given type; returns its index. */
+  addLocal(type) {
+    this.locals.push(type);
+    return this.params.length + this.locals.length - 1;
+  }
+
+  /** The current nesting depth, to be passed to brTo() later as a label. */
+  label() { return this.depth; }
+  /** Branch to a block opened when label() returned `l`. */
+  brTo(l) { return this.br(this.depth - l - 1); }
+  brIfTo(l) { return this.brIf(this.depth - l - 1); }
 
   // ---- constants and locals ---------------------------------------------
   // Constants are normalised into the signed range of their width first.
@@ -108,29 +127,74 @@ export class Func {
   i32eqz() { return this.emit(0x45); }
   i32eq() { return this.emit(0x46); }
   i32ne() { return this.emit(0x47); }
+  i32ltS() { return this.emit(0x48); }
+  i32ltU() { return this.emit(0x49); }
+  i32gtS() { return this.emit(0x4a); }
+  i32gtU() { return this.emit(0x4b); }
+  i32leU() { return this.emit(0x4d); }
+  i32geU() { return this.emit(0x4f); }
   i32add() { return this.emit(0x6a); }
   i32sub() { return this.emit(0x6b); }
   i32and() { return this.emit(0x71); }
   i32or() { return this.emit(0x72); }
-  i64add() { return this.emit(0x7c); }
-  i64sub() { return this.emit(0x7d); }
-  i64and() { return this.emit(0x83); }
-  i64or() { return this.emit(0x84); }
-  i64shl() { return this.emit(0x86); }
-  i64shrU() { return this.emit(0x88); }
+  i32xor() { return this.emit(0x73); }
+  i32shl() { return this.emit(0x74); }
+  i32shrU() { return this.emit(0x76); }
+  i64eqz() { return this.emit(0x50); }
   i64eq() { return this.emit(0x51); }
   i64ne() { return this.emit(0x52); }
+  i64ltS() { return this.emit(0x53); }
+  i64ltU() { return this.emit(0x54); }
+  i64gtS() { return this.emit(0x55); }
+  i64gtU() { return this.emit(0x56); }
+  i64leS() { return this.emit(0x57); }
+  i64leU() { return this.emit(0x58); }
+  i64geS() { return this.emit(0x59); }
+  i64geU() { return this.emit(0x5a); }
+  i64add() { return this.emit(0x7c); }
+  i64sub() { return this.emit(0x7d); }
+  i64mul() { return this.emit(0x7e); }
+  i64and() { return this.emit(0x83); }
+  i64or() { return this.emit(0x84); }
+  i64xor() { return this.emit(0x85); }
+  i64shl() { return this.emit(0x86); }
+  i64shrS() { return this.emit(0x87); }
+  i64shrU() { return this.emit(0x88); }
   i64extendI32u() { return this.emit(0xad); }
+  i64extendI32s() { return this.emit(0xac); }
+  i64extend8s() { return this.emit(0xc2); }
+  i64extend16s() { return this.emit(0xc3); }
+  i64extend32s() { return this.emit(0xc4); }
   i32wrapI64() { return this.emit(0xa7); }
+
+  // ---- guest RAM ----------------------------------------------------------
+  // Memory 1 is guest RAM, 64-bit indexed: the address operand is an i64, and
+  // the memory index travels in the memarg, flagged by bit 6 of the alignment.
+  ram(op, align, offset = 0) { return this.emit(op, align | 0x40, 1, ...uleb(offset)); }
+  ramLoad(size) {                     // zero-extended to i64
+    const op = { 1: 0x31, 2: 0x33, 4: 0x35, 8: 0x29 }[size];
+    return this.ram(op, 0);
+  }
+  ramStore(size) {                    // stack: addr i64, value i64
+    const op = { 1: 0x3c, 2: 0x3d, 4: 0x3e, 8: 0x37 }[size];
+    return this.ram(op, 0);
+  }
+  i64load8u(off) { return this.load(0x31, 0, off); }
+  i64load16u(off) { return this.load(0x33, 1, off); }
+  i64load32u(off) { return this.load(0x35, 2, off); }
+  i64store8(off) { return this.load(0x3c, 0, off); }
+  i64store16(off) { return this.load(0x3d, 1, off); }
+  i64store32(off) { return this.load(0x3e, 2, off); }
 
   // ---- control -----------------------------------------------------------
   // blocktype 0x40 is "no result"; a value type byte is used when the block
   // yields one.
-  if_(blocktype = 0x40) { return this.emit(0x04, blocktype); }
+  if_(blocktype = 0x40) { this.depth++; return this.emit(0x04, blocktype); }
   else_() { return this.emit(0x05); }
-  end() { return this.emit(0x0b); }
-  block(blocktype = 0x40) { return this.emit(0x02, blocktype); }
-  loop(blocktype = 0x40) { return this.emit(0x03, blocktype); }
+  end() { this.depth--; return this.emit(0x0b); }
+  block(blocktype = 0x40) { this.depth++; return this.emit(0x02, blocktype); }
+  loop(blocktype = 0x40) { this.depth++; return this.emit(0x03, blocktype); }
+  select() { return this.emit(0x1b); }
   br(d) { return this.emit(0x0c, ...uleb(d)); }
   brIf(d) { return this.emit(0x0d, ...uleb(d)); }
   return_() { return this.emit(0x0f); }
@@ -183,8 +247,10 @@ export function buildModule({ imports = [], memories = [], globals = [], funcs =
   // Each import kind has its own index space, numbered by the order its
   // entries appear among the imports -- so grouping them by kind here is what
   // makes "global 0" and "function 0" mean what the caller expects.
+  // A 64-bit memory says so in its limits flags (0x04).
   const importSec = vec([
-    ...memories.map((m) => [...str(m.module), ...str(m.name), 0x02, 0x00, ...uleb(m.min)]),
+    ...memories.map((m) => [...str(m.module), ...str(m.name), 0x02,
+                            m.index64 ? 0x04 : 0x00, ...uleb(m.min)]),
     ...globals.map((g) =>
       [...str(g.module), ...str(g.name), 0x03, g.type, g.mutable ? 0x01 : 0x00]),
     ...imports.map((im, i) => [...str(im.module), ...str(im.name), 0x00, ...uleb(importTypes[i])]),

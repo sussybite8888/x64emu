@@ -163,6 +163,11 @@
         (i32.store (i32.const 0x5000) (i32.add (i32.load (i32.const 0x5000)) (i32.const 1)))
         (call $flush_addr_caches)))
     (global.set $cpl_g (local.get $v))
+    ;; Cached translations are tagged with the privilege they were checked
+    ;; at, so they stay valid across the change; lookups just look for the
+    ;; other tag from now on.
+    (global.set $jtlb_bits
+      (i32.or (i32.const 1) (i32.shl (i32.eq (local.get $v) (i32.const 3)) (i32.const 1))))
     (i32.store (i32.const 0xB8) (local.get $v)))
 
   ;; paging enabled?  CR0.PG (bit 31)
@@ -200,10 +205,21 @@
     (i64.store (i32.add (local.get $o) (i32.const 8)) (local.get $base))
     (i32.store (i32.add (local.get $o) (i32.const 16)) (local.get $limit))
     (i32.store (i32.add (local.get $o) (i32.const 20)) (local.get $attr))
+    ;; The fast limit compiled code checks: the limit itself, or -1 to send
+    ;; every access through $seg_lin when the segment is expand-down, whose
+    ;; limit is a lower bound rather than an upper one.
+    (i64.store (i32.add (i32.const 0x1C0) (i32.shl (local.get $s) (i32.const 3)))
+      (if (result i64) (i32.eq (i32.and (local.get $attr) (i32.const 0xC)) (i32.const 8))
+        (then (i64.const -1))
+        (else (i64.extend_i32_u (local.get $limit)))))
     ;; a new code segment moves every instruction address
     (if (i32.eq (local.get $s) (i32.const 1))
       (then (global.set $cs_base (local.get $base))
-            (global.set $fetch_page (i64.const -1)))))
+            (global.set $fetch_page (i64.const -1))))
+    ;; A compiled block was built for one code segment's default sizes and one
+    ;; stack width; a new CS or SS ends it.
+    (if (i32.le_u (i32.sub (local.get $s) (i32.const 1)) (i32.const 1))
+      (then (global.set $jit_exit (i32.const 1)))))
 
   ;; attr bit helpers
   (func $seg_is_code (param $s i32) (result i32)
@@ -228,6 +244,7 @@
   ;;  3 = long mode 64-bit
   (func $recompute_mode
     (call $flush_addr_caches)
+    (global.set $jit_exit (i32.const 1))
     (global.set $vm (i32.const 0))
     (if (i32.eqz (call $pe_on))
       (then (global.set $mode (i32.const 0))

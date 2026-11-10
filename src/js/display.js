@@ -48,14 +48,20 @@ export class Display {
 
   renderGraphics() {
     const { w, h } = this.vga.size;
-    if (!this.imageData || this.imageData.width !== w) {
-      this.imageData = this.ctx.createImageData(w, h);
+    // A frame that arrived already rendered is put on screen as it is.
+    const ready = this.vga.takeImage?.();
+    let img = ready;
+    if (!img) {
+      if (!this.imageData || this.imageData.width !== w || this.imageData.height !== h) {
+        this.imageData = this.ctx.createImageData(w, h);
+      }
+      this.vga.renderGraphics(this.imageData.data);
+      img = this.imageData;
     }
-    this.vga.renderGraphics(this.imageData.data);
-    this.ctx.putImageData(this.imageData, 0, 0);
+    this.ctx.putImageData(img, 0, 0);
     // sampled, so the count costs little on a large mode
     let lit = 0;
-    const d = this.imageData.data;
+    const d = img.data;
     for (let i = 0; i < d.length; i += 64) if (d[i] | d[i + 1] | d[i + 2]) lit++;
     this.litSample = lit;
     this.litTotal = d.length >> 6;
@@ -117,6 +123,69 @@ export class Display {
       this.prevCells[i] = 0xff;             // force a redraw when it moves
     }
     this.cursorDirty = false;
+  }
+}
+
+/**
+ * The screen as a worker last sent it, presented the way Display reads a VGA.
+ *
+ * The emulator runs off the page's thread, so the page never sees video
+ * memory: it is sent text cells, or a graphics frame already rendered to RGBA,
+ * and this answers Display's questions from whichever arrived last.
+ */
+export class FrameSource {
+  constructor() {
+    this.mode = { text: true };
+    this.textCols = 80;
+    this.textRows = 25;
+    this.cells = new Uint8Array(80 * 25 * 2);
+    this.cursorPos = { row: 0, col: 0 };
+    this.w = 720;
+    this.h = 400;
+    this.image = null;
+    this.desc = 'text 80x25';
+  }
+
+  /** Take a frame message; returns a buffer the sender may have back. */
+  update(f) {
+    this.desc = f.desc;
+    if (f.text) {
+      this.mode = { text: true };
+      this.textCols = f.cols;
+      this.textRows = f.rows;
+      this.cells = f.cells;
+      this.cursorPos = f.cursor;
+      return null;
+    }
+    this.mode = { text: false };
+    this.w = f.w;
+    this.h = f.h;
+    this.image = new ImageData(f.rgba, f.w, f.h);
+    this.lastImage = this.image;
+    return null;
+  }
+
+  /** The pending rendered frame, once; Display puts it on screen as it is. */
+  takeImage() {
+    const img = this.image;
+    this.image = null;
+    return img;
+  }
+
+  describe() { return this.desc; }
+
+  get size() {
+    return this.mode.text ? { w: this.textCols * 9, h: this.textRows * 16 }
+                          : { w: this.w, h: this.h };
+  }
+
+  readText() { return this.cells; }
+  get cursor() { return this.cursorPos; }
+
+  // Only reached when a graphics frame is drawn twice; the last one stands.
+  renderGraphics(rgba) {
+    const last = this.lastImage?.data;
+    if (last && last.length === rgba.length) rgba.set(last);
   }
 }
 

@@ -7,7 +7,9 @@ const CASES = [
   { id: 1, name: 'memory' },
   { id: 2, name: 'branches' },
   { id: 3, name: 'mixed' },
-  { id: 4, name: 'string (rep movsq)' },
+  // REP MOVS and STOS move up to a page per step, so retired instructions
+  // say nothing about this one; it is measured by bytes moved.
+  { id: 4, name: 'string (rep movsq)', bytes: 200 * 10000 * 8 },
   { id: 5, name: 'dispatch only (nop)' },
   { id: 6, name: 'add reg,reg only' },
   { id: 7, name: 'mov reg,reg (no flags)' },
@@ -30,15 +32,18 @@ for (const c of CASES) {
 
   const instrs = Number(m.exports.get_cycles());
   const mips = instrs / (ns / 1e9) / 1e6;
-  results.push({ name: c.name, instrs, mips, halted: m.halted });
+  const mbs = c.bytes ? c.bytes / (ns / 1e9) / 1e6 : null;
+  results.push({ name: c.name, instrs, mips, mbs, halted: m.halted });
 }
 
 const width = Math.max(...results.map((r) => r.name.length));
 console.log('');
 for (const r of results) {
-  console.log(`  ${r.name.padEnd(width)}  ${r.mips.toFixed(1).padStart(7)} MIPS` +
-              `   (${(r.instrs / 1e6).toFixed(1)}M instrs)` +
+  const rate = r.mbs !== null ? `${r.mbs.toFixed(0).padStart(7)} MB/s` : `${r.mips.toFixed(1).padStart(7)} MIPS`;
+  console.log(`  ${r.name.padEnd(width)}  ${rate}` +
+              (r.mbs !== null ? '' : `   (${(r.instrs / 1e6).toFixed(1)}M instrs)`) +
               (r.halted ? '' : '  [did not finish]'));
 }
-const total = results.reduce((a, r) => a + r.mips, 0) / results.length;
+const timed = results.filter((r) => r.mbs === null);
+const total = timed.reduce((a, r) => a + r.mips, 0) / timed.length;
 console.log(`  ${'average'.padEnd(width)}  ${total.toFixed(1).padStart(7)} MIPS\n`);

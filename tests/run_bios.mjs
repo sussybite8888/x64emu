@@ -386,8 +386,8 @@ check('no CPU exceptions were taken',
         puts.at(-1).width === 640 && st.lit > 100000 && st.colours > 4,
         `${st.lit} lit, ${st.colours} colours`);
 
-  // a linear VBE mode
-  v.setVbeMode(0x112, true);
+  // a linear VBE mode, 640x480 at 32 bits per pixel
+  v.setVbeMode(0x140, true);
   for (let i = 0; i < 640 * 480; i++) {
     emu9.machine.wr32(v.lfbBase + i * 4, (i & 0xff) | ((i >> 3) & 0xff) << 8 | 0x220000);
   }
@@ -1541,6 +1541,277 @@ check('no CPU exceptions were taken',
   check('the ROM cursor routine puts the cursor where the BDA says',
         ((v.crtc[0x0e] << 8) | v.crtc[0x0f]) === 5 * 80 + 10,
         `at ${(v.crtc[0x0e] << 8) | v.crtc[0x0f]}`);
+}
+
+// ---------------------------------------------------------------------------
+//  the Cirrus GD5446, driven the way cirrus.sys drives it
+// ---------------------------------------------------------------------------
+//  PCI identity and BAR sizing, chip detection, the hidden DAC, an extended
+//  mode, the BitBLT engine through its memory-mapped registers -- fills,
+//  copies both ways, colour expansion fed by the CPU, patterns -- and the
+//  hardware cursor in the rendered frame.
+{
+  const ce = new Emulator({ ramSize: 256 * 1024 * 1024 });
+  await ce.init(readFileSync(join(root, 'build', 'cpu.wasm')));
+  const io = ce.io;
+  const out = (p, v, s = 1) => io.write(p, s, v);
+  const inp = (p, s = 1) => io.read(p, s);
+  const cfg = (dev, reg, size = 4) => { out(0xcf8, (0x80000000 | (dev << 11) | reg) >>> 0, 4); return inp(0xcfc + (reg & 3), size); };
+  const cfgw = (dev, reg, v) => { out(0xcf8, (0x80000000 | (dev << 11) | reg) >>> 0, 4); out(0xcfc, v >>> 0, 4); };
+
+  // PCI identity and BAR sizing
+  check('PCI 02.0 is a CL-GD5446', cfg(2, 0) === 0x00b81013, cfg(2, 0).toString(16));
+  check('display class', (cfg(2, 8) >>> 8) === 0x030000);
+  const bar0 = cfg(2, 0x10);
+  check('BAR0 is the VRAM, prefetchable', (bar0 & ~0xf) === ce.vramBase && (bar0 & 8) === 8, bar0.toString(16));
+  cfgw(2, 0x10, 0xffffffff);
+  const size0 = cfg(2, 0x10);
+  check('BAR0 sizes as 32 MiB', ((~(size0 & ~0xf)) >>> 0) + 1 === 32 * 1024 * 1024, size0.toString(16));
+  cfgw(2, 0x10, bar0);
+  check('BAR0 restores', cfg(2, 0x10) === bar0);
+
+  // chip detection as cirrus.sys does it
+  out(0x3c4, 0x06); out(0x3c5, 0x00);
+  check('SR6 locked reads 0x0F', (out(0x3c4, 6), inp(0x3c5)) === 0x0f);
+  out(0x3c4, 0x06); out(0x3c5, 0x12);
+  check('SR6 unlocks with 0x12', (out(0x3c4, 6), inp(0x3c5)) === 0x12);
+  out(0x3d4, 0x27);
+  check('CR27 is 0xB8', inp(0x3d5) === 0xb8, inp(0x3d5).toString(16));
+  out(0x3c4, 0x15);
+  check('SR15 says 4 MiB', inp(0x3c5) === 0x04);
+
+  // hidden DAC
+  inp(0x3c6); inp(0x3c6); inp(0x3c6); inp(0x3c6); out(0x3c6, 0xe1);
+  inp(0x3c8); inp(0x3c6); inp(0x3c6); inp(0x3c6); inp(0x3c6);
+  check('hidden DAC round trip', inp(0x3c6) === 0xe1);
+
+  // an extended mode, through the BIOS's own routine
+  ce.bios.cirrusSetMode(0x74, true);
+  const m = ce.vga.mode;
+  check('mode 0x74 is 1024x768x16', m.cirrus && m.w === 1024 && m.h === 768 && m.bpp === 16 && m.pitch === 2048,
+        JSON.stringify(m));
+
+  // BitBLT through BAR1's registers
+  const mm = BigInt(ce.cirrus.mmioBase);
+  // the BitBLT registers are at 0x100 in BAR1
+  const mw = (off, size, v) => ce.mmioWrite(mm + 0x100n + BigInt(off), size, BigInt(v));
+  const blt = ({ w, h, dst, src = 0, dpitch = 2048, spitch = 2048, mode = 0x10, rop = 0x0d, ext = 0, fg = 0, bg = 0 }) => {
+    mw(0x00, 4, bg); mw(0x04, 4, fg);
+    mw(0x08, 2, w - 1); mw(0x0a, 2, h - 1);
+    mw(0x0c, 2, dpitch); mw(0x0e, 2, spitch);
+    mw(0x14, 4, src); mw(0x10, 4, dst);
+    mw(0x18, 1, mode); mw(0x1a, 1, rop); mw(0x1b, 1, ext);
+    mw(0x40, 1, 0x02);
+  };
+  const vram = ce.machine.u8, vb = ce.vramBase;
+  const px16 = (x, y) => vram[vb + y * 2048 + x * 2] | (vram[vb + y * 2048 + x * 2 + 1] << 8);
+
+  // solid fill 100x50 at (10,20) with 0xF800 (red in 5:6:5)
+  blt({ w: 200, h: 50, dst: 20 * 2048 + 20, mode: 0x10 | 0xc0, ext: 0x04, fg: 0xf800 });
+  check('solid fill', px16(10, 20) === 0xf800 && px16(109, 69) === 0xf800 && px16(110, 20) === 0 && px16(10, 70) === 0,
+        `${px16(10, 20).toString(16)} ${px16(109, 69).toString(16)} ${px16(110, 20)} ${px16(10, 70)}`);
+
+  // screen to screen copy of that rectangle to (300, 300)
+  blt({ w: 200, h: 50, dst: 300 * 2048 + 600, src: 20 * 2048 + 20 });
+  check('screen copy', px16(300, 300) === 0xf800 && px16(399, 349) === 0xf800 && px16(400, 300) === 0);
+
+  // overlapping copy downwards: backwards, from the bottom right corner
+  blt({ w: 200, h: 50, dst: (349 + 10) * 2048 + 600 + 199, src: 349 * 2048 + 600 + 199, mode: 0x11 });
+  check('backward overlapping copy', px16(300, 310) === 0xf800 && px16(399, 359) === 0xf800);
+
+  // colour expansion from the host: 16x2 pixels, bits from the CPU, transparent zeros
+  blt({ w: 32, h: 2, dst: 500 * 2048 + 1000, mode: 0x10 | 0x80 | 0x04 | 0x08, fg: 0x07e0 });
+  check('a host transfer is pending', (ce.cirrus.readGc(0x31) & 1) === 1);
+  check('and BAR1 reports it busy', (Number(ce.mmioRead(mm + 0x140n, 1)) & 1) === 1);
+  ce.mmioWrite(mm + 0x04n, 1, 0x12n); ce.mmioWrite(mm + 0x05n, 1, 0x34n);
+  check('BAR1 below 0x100 is the VGA ports', ce.vga.seq[0x12] === 0x34);
+  ce.mmioWrite(mm + 0x04n, 1, 0x12n); ce.mmioWrite(mm + 0x05n, 1, 0x00n);
+  const fb = BigInt(ce.vramBase);
+  // Monochrome lines are packed a byte apart: 2 bytes per 16-pixel line, so
+  // both lines arrive in one dword.
+  ce.mmioWrite(fb, 4, 0xaa55f00fn);           // line 0: 0x0F, 0xF0; line 1: 0x55, 0xAA
+  check('the transfer completes', (ce.cirrus.readGc(0x31) & 1) === 0);
+  check('expanded pixels', px16(504, 500) === 0x07e0 && px16(503, 500) === 0 && px16(508, 500) === 0x07e0 &&
+        px16(512, 500) === 0 && px16(501, 501) === 0x07e0 && px16(500, 501) === 0,
+        [504, 503, 508, 512].map((x) => px16(x, 500).toString(16)).join(' ') + ' / ' + px16(501, 501).toString(16));
+  check('framebuffer is memory again', ce.machine.translateFor(ce.vramBase, true) !== null);
+
+  // A glyph: 8 pixels wide, 6 lines, one byte a line -- six bytes, sent as
+  // two dwords whose last two bytes are padding.  Expecting a dword a line
+  // left a transfer like this waiting for data that never came, and every
+  // framebuffer write after it went to the blitter: windows stopped painting.
+  blt({ w: 16, h: 6, dst: 520 * 2048 + 1000, mode: 0x10 | 0x80 | 0x04 | 0x08, fg: 0x001f });
+  ce.mmioWrite(fb, 4, 0x81422418n);
+  ce.mmioWrite(fb, 4, 0x0000ff00n);
+  check('a narrow host transfer finishes on the data it is given',
+        (ce.cirrus.readGc(0x31) & 1) === 0 && !ce.cirrus.trapping);
+  check('and draws each line from its own byte',
+        px16(503, 520) === 0x001f && px16(504, 520) === 0x001f && px16(502, 521) === 0x001f &&
+        px16(500, 524) === 0 && px16(500, 525) === 0x001f && px16(507, 525) === 0x001f,
+        [px16(503, 520), px16(502, 521), px16(500, 525)].map((v) => v.toString(16)).join(' '));
+
+  // With dword granularity (GR33 bit 0) each line does start on a dword.
+  blt({ w: 16, h: 2, dst: 530 * 2048 + 1000, mode: 0x10 | 0x80 | 0x04, ext: 0x01, fg: 0xffff, bg: 0 });
+  ce.mmioWrite(fb, 4, 0x000000ffn);
+  ce.mmioWrite(fb, 4, 0x00000080n);
+  check('dword granularity puts each line in its own dword',
+        (ce.cirrus.readGc(0x31) & 1) === 0 && px16(507, 530) === 0xffff && px16(500, 531) === 0xffff &&
+        px16(501, 531) === 0);
+
+  // 8x8 mono pattern fill
+  for (let i = 0; i < 8; i++) vram[vb + 0x300000 + i] = i & 1 ? 0xaa : 0x55;
+  blt({ w: 32, h: 4, dst: 600 * 2048 + 0, src: 0x300000, mode: 0x10 | 0xc0, fg: 0xffff, bg: 0x001f });
+  check('mono pattern fill', px16(0, 600) === 0x001f && px16(1, 600) === 0xffff && px16(0, 601) === 0xffff,
+        [px16(0, 600), px16(1, 600), px16(0, 601)].map((v) => v.toString(16)).join(' '));
+
+  // The BitBLT registers at 0xB8000, where Windows XP's driver puts them
+  // (SR17 = 0x24): the window has to reach the chip, not the text buffer.
+  let routed = null;
+  const prevRouting = ce.vga.onWindowRouting;
+  ce.vga.onWindowRouting = (v) => { routed = v; prevRouting(v); };
+  out(0x3c4, 0x17); out(0x3c5, 0x24);
+  check('SR17 routes the 0xB8000 register window', routed === 2, String(routed));
+  const b8 = (off, size, v) => ce.mmioWrite(0xb8000n + BigInt(off), size, BigInt(v));
+  b8(0x04, 4, 0x07e0); b8(0x08, 2, 20 - 1); b8(0x0a, 2, 3 - 1);
+  b8(0x0c, 2, 2048); b8(0x18, 1, 0x10 | 0xc0); b8(0x1a, 1, 0x0d); b8(0x1b, 1, 0x04);
+  b8(0x10, 4, 700 * 2048 + 40);
+  b8(0x40, 1, 0x02);
+  check('a fill started through 0xB8000 happens', px16(20, 700) === 0x07e0 && px16(29, 702) === 0x07e0 &&
+        px16(30, 700) === 0, [px16(20, 700), px16(29, 702), px16(30, 700)].map((v) => v.toString(16)).join(' '));
+  check('and its status reads back from there', (Number(ce.mmioRead(0xb8040n, 1)) & 1) === 0);
+  out(0x3c4, 0x17); out(0x3c5, 0x20);
+  check('turning it off gives 0xB8000 back to memory', routed === 1, String(routed));
+
+  // render with a hardware cursor
+  out(0x3c4, 0x12); out(0x3c5, 0x03);          // cursor on, extended DAC colours
+  out(0x3c8, 0x0f); out(0x3c9, 63); out(0x3c9, 63); out(0x3c9, 63);   // foreground white
+  out(0x3c4, 0x12); out(0x3c5, 0x01);
+  out(0x3c4, 0x13); out(0x3c5, 0x00);
+  const cbase = vb + 4 * 1024 * 1024 - 16384;
+  for (let i = 0; i < 128; i++) { vram[cbase + i] = 0xff; vram[cbase + 128 + i] = 0xff; }
+  out(0x3c4, 0x10 | (5 << 5)); out(0x3c5, 100 >> 3);   // x = 101
+  out(0x3c4, 0x11); out(0x3c5, 200 >> 3);              // y = 200
+  const rgba = new Uint8ClampedArray(1024 * 768 * 4);
+  ce.vga.renderGraphics(rgba);
+  const at = (x, y) => [...rgba.slice((y * 1024 + x) * 4, (y * 1024 + x) * 4 + 3)];
+  check('red fill renders red', at(10, 20).join() === '255,0,0', at(10, 20).join());
+  check('cursor drawn in white', at(110, 210).join() === '252,252,252', at(110, 210).join());
+}
+
+// ---------------------------------------------------------------------------
+//  VBE window A: banked access to a VBE mode through 0xA0000
+// ---------------------------------------------------------------------------
+//  Windows 95's Super VGA driver dates from before linear framebuffers were
+//  usual and reaches video memory 64 KiB at a time, moving the window with
+//  4F05h.  The window has to land in video memory, at the bank it was told.
+{
+  const ve = new Emulator({ ramSize: 64 * 1024 * 1024, display: 'vga' });
+  await ve.init(readFileSync(join(root, 'build', 'cpu.wasm')));
+  const v = ve.vga;
+  v.setVbeMode(0x101, false);
+  v.setVbeBank(1);
+  ve.mmioWrite(0xa0005n, 1, 0x77n);
+  ve.mmioWrite(0xaffffn, 1, 0x88n);
+  check('a write through window A lands in its bank of video memory',
+        ve.machine.u8[v.lfbBase + 0x10005] === 0x77 && ve.machine.u8[v.lfbBase + 0x1ffff] === 0x88,
+        `${ve.machine.u8[v.lfbBase + 0x10005]} ${ve.machine.u8[v.lfbBase + 0x1ffff]}`);
+  v.setVbeBank(0);
+  ve.machine.u8[v.lfbBase + 3] = 0x5a;
+  check('and reads come back from the bank shown', Number(ve.mmioRead(0xa0003n, 1)) === 0x5a);
+}
+
+// ---------------------------------------------------------------------------
+//  the reset button
+// ---------------------------------------------------------------------------
+//  The page's Reset: the same machine from power-on -- CPU, chipset, PCI
+//  configuration and display adapter -- with every disk as the guest left it.
+{
+  const { Disk, MemoryStore } = await import('../src/js/disk.js');
+  const re = new Emulator({ ramSize: 256 * 1024 * 1024, sliceSize: 1000 });
+  await re.init(readFileSync(join(root, 'build', 'cpu.wasm')));
+  re.onSerial = () => {};
+  re.bios.log = () => {};
+  check('reset with nothing booted does nothing', re.reset() === false);
+
+  const bytes = new Uint8Array(1440 * 1024);
+  bytes[510] = 0x55; bytes[511] = 0xaa;
+  const image = new Disk(new MemoryStore(bytes), 'floppy', 'r.img');
+  re.bootImage(image, { hddSize: 16 * 1024 * 1024, hddName: 'ram0' });
+  re.step(); re.step();
+
+  // what a running system leaves behind: writes to both drives, paging on,
+  // the adapter in an extended mode, BAR1 moved and the triple-fault guard
+  // nearly spent
+  image.write(100, new Uint8Array(512).fill(0xA5));
+  re.ramDisk.write(1234, new Uint8Array(512).fill(0xC3));
+  const ram = re.ramDisk;
+  const x = re.machine.exports;
+  x.set_cr(0, 0x80000011n);
+  re.bios.cirrusSetMode(0x74, true);
+  const out = (p, v, s = 1) => re.io.write(p, s, v);
+  const cfg = (reg) => { out(0xcf8, (0x80000000 | (2 << 11) | reg) >>> 0, 4); return re.io.read(0xcfc, 4); };
+  const bar1 = cfg(0x14);
+  out(0xcf8, (0x80000000 | (2 << 11) | 0x14) >>> 0, 4); out(0xcfc, 0xfd000000, 4);
+  check('the test really did move BAR1', cfg(0x14) === 0xfd000000, cfg(0x14).toString(16));
+  re.tripleFaults = 9;
+
+  check('reset reports it ran', re.reset() === true);
+  check('the CPU is back in real mode with paging off',
+        x.get_mode() === 0 && (Number(x.get_cr(0)) & 0x80000001) === 0,
+        `mode=${x.get_mode()} cr0=0x${Number(x.get_cr(0)).toString(16)}`);
+  check('the screen is back in 80x25 text', re.vga.mode.text && !re.vga.mode.cirrus, re.vga.describe());
+  check('the Cirrus extensions are locked again', re.vga.seq[0x07] === 0 && !re.cirrus.trapping);
+  check('BAR1 is back where the BIOS put it', cfg(0x14) === bar1, cfg(0x14).toString(16));
+  check('the boot image keeps what the guest wrote',
+        re.bios.bootDisk === image && image.read(100, 1)?.[0] === 0xA5);
+  check('the RAM drive is the same drive, with what the guest wrote',
+        re.ramDisk === ram && ram.read(1234, 1)?.[0] === 0xC3);
+  check('the triple-fault guard starts afresh', re.tripleFaults === 0);
+  let ran = true;
+  for (let i = 0; i < 20 && ran; i++) ran = re.step();
+  check('and the machine runs again', ran && re.stats.instructions > 0);
+}
+
+// ---------------------------------------------------------------------------
+//  what POST leaves for the operating system: memory sizes and the APIC
+// ---------------------------------------------------------------------------
+//  TempleOS sizes memory by the larger of E801 and E820, and turns the local
+//  APIC on without programming LINT0.  Each of the BIOS's answers has to agree
+//  with the others, and the APIC has to be left in virtual wire mode, or it
+//  puts its heap in the framebuffer and never sees a timer tick.
+{
+  const pe = new Emulator({ ramSize: 512 * 1024 * 1024, sliceSize: 1000 });
+  await pe.init(readFileSync(join(root, 'build', 'cpu.wasm')));
+  pe.onSerial = () => {};
+  pe.bios.log = () => {};
+  const stub = new Uint8Array(512); stub[510] = 0x55; stub[511] = 0xaa;
+  pe.bootImage({ data: stub, name: 's.img', kind: 'floppy' });
+  const b = pe.bios;
+  const usableEnd = pe.vramBase;
+  check('the E820 map stops usable RAM at the framebuffer',
+        b.e820.some((e) => e.type === 1 && e.base === 0x100000 && e.base + e.size === usableEnd));
+
+  b.setR16(0, 0xe801); b.dispatch(0x15);
+  const e801 = 0x100000 + (b.r16(0) & 0xffff) * 1024 + (b.r16(3) & 0xffff) * 65536;
+  check('E801 reports the same end of RAM as E820', e801 === usableEnd,
+        `E801 0x${e801.toString(16)}, E820 0x${usableEnd.toString(16)}`);
+  b.setR16(0, 0x8800); b.dispatch(0x15);
+  check('and 88h no more than that', 0x100000 + (b.r16(0) & 0xffff) * 1024 <= usableEnd);
+  const cmos = (r) => { pe.io.write(0x70, 1, r); return pe.io.read(0x71, 1); };
+  const cmosEnd = 16 * 1024 * 1024 + (cmos(0x34) | (cmos(0x35) << 8)) * 65536;
+  check('CMOS 34h/35h agree', cmosEnd === usableEnd,
+        `CMOS 0x${cmosEnd.toString(16)}, E820 0x${usableEnd.toString(16)}`);
+
+  const L = pe.lapic;
+  check('POST leaves the local APIC in virtual wire mode',
+        L.accepting && L.extIntOpen && (L.lvt[3] & 0x10700) === 0x700 && (L.lvt[4] & 0x10700) === 0x400,
+        `svr=0x${L.svr.toString(16)} lint0=0x${L.lvt[3].toString(16)} lint1=0x${L.lvt[4].toString(16)}`);
+  // what TempleOS does: enable through SVR, set up logical addressing, and
+  // leave LINT0 alone
+  L.write(0x0f0, 4, 0x1ff); L.write(0x0d0, 4, 0); L.write(0x0e0, 4, 0xf0000000);
+  pe.io.pic.raise(0);
+  check('and the timer still gets through once the OS enables the APIC itself',
+        pe.interruptPending() && pe.acknowledgeInterrupt() === 0x08);
 }
 
 console.log(failures ? `\n${failures} failing` : '\nall BIOS/VGA/disk tests passed');

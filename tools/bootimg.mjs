@@ -34,7 +34,9 @@ if (!files.length) {
                 '  --kind K       cdrom | hdd | floppy (default: auto-detect)\n' +
                 '  --ram SIZE     guest RAM, e.g. 512M or 8G (no upper bound)\n' +
                 '  --hdd SIZE     size of the blank RAM drive (default 1G, 0 to omit)\n' +
-                '  --type TEXT    type TEXT once --after appears on screen');
+                '  --type TEXT    type TEXT once --after appears on screen\n' +
+                '  --jit on|off   compile hot code to WebAssembly (default on)\n' +
+                '  --display D    cirrus | vga (default cirrus)');
   process.exit(2);
 }
 
@@ -62,7 +64,8 @@ function dumpText() {
   return out;
 }
 
-const emu = new Emulator({ ramSize, sliceSize: 500_000 });
+const emu = new Emulator({ ramSize, sliceSize: 500_000, jit: flags.jit !== 'off',
+                           display: flags.display ?? 'cirrus' });
 await emu.init(readFileSync(join(root, 'build', 'cpu.wasm')));
 
 let line = '';

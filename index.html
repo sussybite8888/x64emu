@@ -144,9 +144,17 @@
 
     <div class="controls">
       <button id="pause" disabled>Pause</button>
+      <button id="reset" disabled title="Restart the machine from power-on, like a PC's reset button. Disk changes are kept.">Reset</button>
       <button id="stop">Stop</button>
       <button id="grabKeys" class="on">Keyboard: display</button>
       <label>RAM <input type="text" id="ram" value="256M" size="6"></label>
+      <label title="The PCI display adapter. Windows XP and 2000 have a driver for the Cirrus chip and get up to 1280x1024 and 24-bit colour from it; Windows 95's own Super VGA driver uses VBE, which both provide.">display
+        <select id="display" style="background:#0d1016;color:var(--ink);border:1px solid var(--edge);border-radius:5px;padding:5px;font-size:12px">
+          <option value="cirrus">Cirrus GD5446</option>
+          <option value="vga">VGA + VBE only</option>
+        </select>
+      </label>
+      <label title="Compile hot guest code to WebAssembly. Off runs everything through the interpreter."><input type="checkbox" id="jit" checked> JIT</label>
       <label>zoom <input type="number" id="zoom" value="0" min="0" max="6" step="1" title="0 = fit to panel"></label>
     </div>
 
@@ -168,6 +176,7 @@
       <h2>Machine</h2>
       <div class="stat"><span>state</span><span id="state">idle</span></div>
       <div class="stat"><span>MIPS</span><span id="mips">0.0</span></div>
+      <div class="stat"><span>JIT</span><span id="jitStat">-</span></div>
       <div class="stat"><span>instructions</span><span id="instrs">0</span></div>
       <div class="stat"><span>mode</span><span id="mode">-</span></div>
       <div class="stat"><span>CPL</span><span id="cpl">-</span></div>

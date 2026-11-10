@@ -34,6 +34,7 @@ const CASES = [
   { name: 't_sse2int', mode: 'long' },
   { name: 't_fxsave', mode: 'long' },
   { name: 't_mmx', mode: 'long' },
+  { name: 't_jit', mode: 'long' },
 ];
 
 let failures = 0;

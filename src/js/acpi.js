@@ -140,13 +140,18 @@ function dwordMemory(min, max) {
           ...le32(0), ...le32(min), ...le32(max), ...le32(0), ...le32(max - min + 1)];
 }
 
-function pciRootBridge() {
+function pciRootBridge(framebuffer) {
   const crs = [
     ...wordSpace(2, 0x0000, 0x00ff, 0x00),           // buses 0-255
     0x47, 0x01, ...le16(0xcf8), ...le16(0xcf8), 0x01, 0x08,   // its config ports
     ...wordSpace(1, 0x0000, 0x0cf7, 0x03),           // I/O either side of them
     ...wordSpace(1, 0x0d00, 0xffff, 0x03),
     ...dwordMemory(0x000a0000, 0x000bffff),          // the VGA window
+    // The display adapter's framebuffer BAR sits at the top of RAM, where
+    // its memory really is; the bridge has to claim that range too, or the
+    // guest sees a BAR outside every window and moves it somewhere that is
+    // not memory at all.
+    ...(framebuffer ? dwordMemory(framebuffer.base, framebuffer.base + framebuffer.size - 1) : []),
     ...dwordMemory(0xc0000000, 0xfebfffff),          // and room for BARs
     ...END_TAG,
   ];
@@ -175,7 +180,7 @@ function ps2Devices() {
   ];
 }
 
-function dsdtBody() {
+function dsdtBody(framebuffer) {
   return Uint8Array.from([
     0x08,                                    // NameOp
     0x5c, 0x5f, 0x53, 0x35, 0x5f,            // \_S5_
@@ -185,14 +190,14 @@ function dsdtBody() {
     0x0a, 0x05,                              // PM1a SLP_TYP = 5
     0x0a, 0x05,                              // PM1b SLP_TYP = 5
     0x00, 0x00,                              // reserved
-    ...aml.scope([0x5c, ...aml.seg('_SB_')], pciRootBridge()),
+    ...aml.scope([0x5c, ...aml.seg('_SB_')], pciRootBridge(framebuffer)),
   ]);
 }
 
 // ---- table builders --------------------------------------------------------
 
-function buildDsdt() {
-  const body = dsdtBody();
+function buildDsdt(framebuffer) {
+  const body = dsdtBody(framebuffer);
   const buf = new Uint8Array(36 + body.length);
   header(buf, 'DSDT', 2, 'X64EMUDS');
   buf.set(body, 36);
@@ -294,7 +299,8 @@ function buildRsdp(rsdtAddr, xsdtAddr) {
  *
  * @returns {{bytes: Uint8Array, base: number, rsdp: number}}
  */
-export function buildAcpiTables({ base = ACPI_BASE, cpuCount = 1, madt = true } = {}) {
+export function buildAcpiTables({ base = ACPI_BASE, cpuCount = 1, madt = true,
+                                  framebuffer = null } = {}) {
   const parts = [];
   let off = 0;
   const place = (bytes, align = 16) => {
@@ -308,7 +314,7 @@ export function buildAcpiTables({ base = ACPI_BASE, cpuCount = 1, madt = true } 
   // The RSDP goes first so it lands on the 16-byte boundary at `base`.
   const rsdpSlot = place(new Uint8Array(36));
   const facsAddr = place(buildFacs(), 64);   // the FACS wants 64-byte alignment
-  const dsdtAddr = place(buildDsdt());
+  const dsdtAddr = place(buildDsdt(framebuffer));
   const fadtAddr = place(buildFadt(facsAddr, dsdtAddr));
   const tables = [fadtAddr];
   if (madt) tables.push(place(buildMadt(cpuCount)));

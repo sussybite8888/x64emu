@@ -27,14 +27,21 @@
     (if (global.get $vga_mmio)
       (then
         ;; the planar window belongs to the adapter, not to memory
-        (if (i32.and (i64.lt_u (local.get $pa) (i64.const 0xB0000))
+        (if (i32.and (i64.lt_u (local.get $pa) (global.get $vga_win_hi))
                      (i64.ge_u (i64.add (local.get $pa) (i64.extend_i32_u (local.get $size)))
                                (i64.const 0xA0000)))
           (then (return (i32.const 0))))))
+    (if (i32.and (i64.lt_u (local.get $pa) (global.get $trap_hi))
+                 (i64.gt_u (i64.add (local.get $pa) (i64.extend_i32_u (local.get $size)))
+                           (global.get $trap_lo)))
+      (then (return (i32.const 0))))
     (i64.le_u (i64.add (local.get $pa) (i64.extend_i32_u (local.get $size)))
               (global.get $ram_size)))
 
   ;; Guest RAM lives in memory 1, indexed by the physical address itself.
+  ;; A store to a device may change what interrupts are pending -- an APIC
+  ;; EOI or task priority write, a timer reprogrammed -- and the interpreter
+  ;; would look before the next instruction, so a compiled block stops there.
   (func $phys_r8 (param $pa i64) (result i64)
     (if (result i64) (call $in_ram (local.get $pa) (i32.const 1))
       (then (i64.load8_u $ram (local.get $pa)))
@@ -58,22 +65,26 @@
   (func $phys_w8 (param $pa i64) (param $v i64)
     (if (call $in_ram (local.get $pa) (i32.const 1))
       (then (i64.store8 $ram (local.get $pa) (local.get $v)))
-      (else (call $mmio_write (local.get $pa) (i32.const 1) (local.get $v)))))
+      (else (call $mmio_write (local.get $pa) (i32.const 1) (local.get $v))
+            (global.set $jit_exit (i32.const 1)))))
 
   (func $phys_w16 (param $pa i64) (param $v i64)
     (if (call $in_ram (local.get $pa) (i32.const 2))
       (then (i64.store16 $ram align=1 (local.get $pa) (local.get $v)))
-      (else (call $mmio_write (local.get $pa) (i32.const 2) (local.get $v)))))
+      (else (call $mmio_write (local.get $pa) (i32.const 2) (local.get $v))
+            (global.set $jit_exit (i32.const 1)))))
 
   (func $phys_w32 (param $pa i64) (param $v i64)
     (if (call $in_ram (local.get $pa) (i32.const 4))
       (then (i64.store32 $ram align=1 (local.get $pa) (local.get $v)))
-      (else (call $mmio_write (local.get $pa) (i32.const 4) (local.get $v)))))
+      (else (call $mmio_write (local.get $pa) (i32.const 4) (local.get $v))
+            (global.set $jit_exit (i32.const 1)))))
 
   (func $phys_w64 (param $pa i64) (param $v i64)
     (if (call $in_ram (local.get $pa) (i32.const 8))
       (then (i64.store $ram align=1 (local.get $pa) (local.get $v)))
-      (else (call $mmio_write (local.get $pa) (i32.const 8) (local.get $v)))))
+      (else (call $mmio_write (local.get $pa) (i32.const 8) (local.get $v))
+            (global.set $jit_exit (i32.const 1)))))
 
   (func $phys_rN (param $pa i64) (param $size i32) (result i64)
     (block $d (result i64)
@@ -97,29 +108,29 @@
                         (i32.const 1023))
                (i32.const 4))))
 
-  ;; Everything that can change a translation drops the address caches.
+  ;; Everything that can change a translation, or the privilege it was checked
+  ;; at, drops the code page cache.  Data translations live in the JIT TLB,
+  ;; whose tags carry the privilege, and are dropped by the TLB flushes below.
   (func $flush_addr_caches
-    (global.set $fetch_page (i64.const -1))
-    (global.set $dr_page (i64.const -1))
-    (global.set $dw_page (i64.const -1)))
+    (global.set $fetch_page (i64.const -1)))
 
+  ;; Compiled blocks are keyed on physical addresses and survive a flush; what
+  ;; does not survive is a running block's assumption that the next linear
+  ;; address still maps where it did, so the block is told to stop.
   (func $tlb_flush
-    (local $i i32)
     (call $flush_addr_caches)
-    ;; Blocks are keyed on linear addresses, so anything that changes what a
-    ;; linear address maps to invalidates every one of them.
-    (if (global.get $jit_on) (then (call $jit_flush)))
-    (local.set $i (i32.const 0))
-    (block $end (loop $l
-      (br_if $end (i32.ge_u (local.get $i) (i32.const 1024)))
-      (i64.store (i32.add (i32.const 0x1000) (i32.shl (local.get $i) (i32.const 4)))
-                 (i64.const 0))
-      (local.set $i (i32.add (local.get $i) (i32.const 1)))
-      (br $l))))
+    (memory.fill (i32.const 0x1000) (i32.const 0) (i32.const 0x4000))
+    (call $jtlb_flush_all)
+    (global.set $jit_exit (i32.const 1)))
 
   (func $tlb_flush_page (param $va i64)
+    (local $j i32)
     (call $flush_addr_caches)
-    (i64.store (call $tlb_slot (local.get $va)) (i64.const 0)))
+    (i64.store (call $tlb_slot (local.get $va)) (i64.const 0))
+    (local.set $j (call $jtlb_slot (local.get $va)))
+    (i64.store (i32.add (global.get $JTLB_R) (local.get $j)) (i64.const 0))
+    (i64.store (i32.add (global.get $JTLB_W) (local.get $j)) (i64.const 0))
+    (global.set $jit_exit (i32.const 1)))
 
   ;; ---- page walk ---------------------------------------------------------
   ;;  access: 0 = read, 1 = write, 2 = instruction fetch
@@ -372,31 +383,37 @@
              (global.get $a20_mask)))
 
   ;; ---- linear memory access (page-split aware) ---------------------------
+  ;;  Both directions go through the JIT TLB first: a direct-mapped table of
+  ;;  4096 pages per direction, each entry a tag (the linear page, plus the
+  ;;  privilege it was checked at) and the distance to its physical page.  An
+  ;;  entry exists only for ordinary RAM that the access was allowed to reach,
+  ;;  so a hit needs no further check.  Compiled code inlines the same lookup.
   (func $lin_read (param $la i64) (param $size i32) (result i64)
-    (local $pa i64) (local $i i32) (local $v i64) (local $off i32)
+    (local $pa i64) (local $i i32) (local $v i64) (local $off i32) (local $slot i32)
+    (local $tag i64)
     (if (global.get $fault) (then (return (i64.const 0))))
     (local.set $off (i32.wrap_i64 (i64.and (local.get $la) (i64.const 4095))))
-    ;; Same page as the previous load, and the access fits inside it.  The
-    ;; cache is bypassed entirely while $sysacc is set, because those reads skip
-    ;; the user/supervisor check and must not leave a translation behind that
-    ;; ordinary code could then hit.
-    (if (i32.and (i32.eqz (global.get $sysacc)) (i32.and
-          (i64.eq (i64.and (local.get $la) (i64.const -4096)) (global.get $dr_page))
-          (i32.le_u (i32.add (local.get $off) (local.get $size)) (i32.const 4096))))
-      (then (return (call $ram_load
-              (i64.add (global.get $dr_phys) (i64.extend_i32_u (local.get $off)))
-              (local.get $size)))))
     ;; fast path: access does not cross a page boundary
     (if (i32.le_u (i32.add (local.get $off) (local.get $size)) (i32.const 4096))
       (then
+        ;; An access the CPU makes on its own behalf is a supervisor access
+        ;; whatever the current privilege, and looks for that kind of entry.
+        (local.set $tag (i64.or (i64.and (local.get $la) (i64.const -4096))
+                                (i64.extend_i32_u (select (i32.const 1) (global.get $jtlb_bits)
+                                                          (global.get $sysacc)))))
+        (local.set $slot (i32.add (global.get $JTLB_R) (call $jtlb_slot (local.get $la))))
+        (if (i64.eq (i64.load (local.get $slot)) (local.get $tag))
+          (then (return (call $ram_load
+                  (i64.add (local.get $la) (i64.load offset=8 (local.get $slot)))
+                  (local.get $size)))))
         (local.set $pa (call $translate (local.get $la) (i32.const 0)))
         (if (global.get $fault) (then (return (i64.const 0))))
         (if (call $in_ram (i64.and (local.get $pa) (i64.const -4096)) (i32.const 4096))
           (then
-            (if (i32.eqz (global.get $sysacc))
-              (then
-                (global.set $dr_page (i64.and (local.get $la) (i64.const -4096)))
-                (global.set $dr_phys (i64.and (local.get $pa) (i64.const -4096)))))
+            (i64.store (local.get $slot) (local.get $tag))
+            (i64.store offset=8 (local.get $slot)
+              (i64.sub (i64.and (local.get $pa) (i64.const -4096))
+                       (i64.and (local.get $la) (i64.const -4096))))
             (return (call $ram_load (local.get $pa) (local.get $size)))))
         (return (call $phys_rN (local.get $pa) (local.get $size)))))
     ;; slow path: assemble byte by byte
@@ -416,7 +433,7 @@
     (local.get $v))
 
   (func $lin_write (param $la i64) (param $size i32) (param $v i64)
-    (local $pa i64) (local $i i32) (local $off i32)
+    (local $pa i64) (local $i i32) (local $off i32) (local $slot i32) (local $tag i64)
     ;; i32.and is bitwise, so the length has to be reduced to 0/1 first or a
     ;; length like 0x10 ands away the comparison result entirely
     (if (i32.and (i32.ne (global.get $watch_len) (i32.const 0))
@@ -427,30 +444,34 @@
                    (i64.gt_u (i64.add (local.get $la) (i64.extend_i32_u (local.get $size)))
                              (global.get $watch_lo))))
       (then (call $watch_record (local.get $la) (local.get $size) (local.get $v))))
-    ;; A write into a page some compiled block was built from invalidates it.
-    ;; The test costs one predictable branch while the JIT is off.
-    (if (global.get $jit_on) (then (call $jit_check_write (local.get $la))))
     (if (global.get $fault) (then (return)))
     (local.set $off (i32.wrap_i64 (i64.and (local.get $la) (i64.const 4095))))
-    ;; same page as the previous store; the cache is only filled once the page
-    ;; has been shown to be writable at the current privilege level
-    (if (i32.and (i32.eqz (global.get $sysacc)) (i32.and
-          (i64.eq (i64.and (local.get $la) (i64.const -4096)) (global.get $dw_page))
-          (i32.le_u (i32.add (local.get $off) (local.get $size)) (i32.const 4096))))
-      (then (call $ram_store
-              (i64.add (global.get $dw_phys) (i64.extend_i32_u (local.get $off)))
-              (local.get $size) (local.get $v))
-            (return)))
     (if (i32.le_u (i32.add (local.get $off) (local.get $size)) (i32.const 4096))
       (then
+        ;; A write entry is only ever made for a page holding no compiled code
+        ;; and none being watched, so a hit can store without looking further.
+        (local.set $tag (i64.or (i64.and (local.get $la) (i64.const -4096))
+                                (i64.extend_i32_u (select (i32.const 1) (global.get $jtlb_bits)
+                                                          (global.get $sysacc)))))
+        (local.set $slot (i32.add (global.get $JTLB_W) (call $jtlb_slot (local.get $la))))
+        (if (i64.eq (i64.load (local.get $slot)) (local.get $tag))
+          (then (call $ram_store
+                  (i64.add (local.get $la) (i64.load offset=8 (local.get $slot)))
+                  (local.get $size) (local.get $v))
+                (return)))
         (local.set $pa (call $translate (local.get $la) (i32.const 1)))
         (if (global.get $fault) (then (return)))
         (if (call $in_ram (i64.and (local.get $pa) (i64.const -4096)) (i32.const 4096))
           (then
-            (if (i32.eqz (global.get $sysacc))
-              (then
-                (global.set $dw_page (i64.and (local.get $la) (i64.const -4096)))
-                (global.set $dw_phys (i64.and (local.get $pa) (i64.const -4096)))))
+            (if (call $jit_is_code (local.get $pa))
+              (then (call $jit_code_store (local.get $pa) (local.get $size)))
+              (else
+                (if (i32.eqz (global.get $watch_len))
+                  (then
+                    (i64.store (local.get $slot) (local.get $tag))
+                    (i64.store offset=8 (local.get $slot)
+                      (i64.sub (i64.and (local.get $pa) (i64.const -4096))
+                               (i64.and (local.get $la) (i64.const -4096))))))))
             (call $ram_store (local.get $pa) (local.get $size) (local.get $v))
             (return)))
         (call $phys_wN (local.get $pa) (local.get $size) (local.get $v))
@@ -469,6 +490,8 @@
                        (i64.add (local.get $la) (i64.extend_i32_u (local.get $i)))
                        (i32.const 1)))
       (if (global.get $fault) (then (return)))
+      (if (call $jit_is_code (local.get $pa))
+        (then (call $jit_code_store (local.get $pa) (i32.const 1))))
       (call $phys_w8 (local.get $pa)
             (i64.and (i64.shr_u (local.get $v)
                                 (i64.extend_i32_u (i32.shl (local.get $i) (i32.const 3))))

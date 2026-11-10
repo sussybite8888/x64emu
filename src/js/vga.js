@@ -88,6 +88,20 @@ const BIOS_MODES = new Map([
   [0x13, { text: false, w: 320, h: 200, bpp: 8, linear: 0xa0000 }],
 ]);
 
+// For each plane byte, its eight bits moved to the bottom of eight nibbles,
+// leftmost pixel (bit 7) in the lowest.  ORing four planes' entries, each
+// shifted by its plane number, yields eight pixels' colour indices at once.
+// The machines this runs on are little-endian, which the RGBA words assume.
+const PLANE_SPREAD = (() => {
+  const t = new Uint32Array(256);
+  for (let b = 0; b < 256; b++) {
+    let v = 0;
+    for (let px = 0; px < 8; px++) if (b & (0x80 >> px)) v |= 1 << (px * 4);
+    t[b] = v >>> 0;
+  }
+  return t;
+})();
+
 export const VGA_WINDOW_BASE = 0xa0000;
 export const VGA_WINDOW_SIZE = 0x10000;
 
@@ -115,6 +129,8 @@ export class VGA {
     this.dispi[DISPI_ID] = 0xb0c5;
     this.lfbEnabled = false;
     this.currentVbeMode = 0x03;
+    // The 64 KiB of video memory window A shows in a VBE mode (4F05h).
+    this.vbeBank = 0;
 
     // VGA register files, kept so reads return what was written
     this.crtcIndex = 0;
@@ -122,9 +138,11 @@ export class VGA {
     // clears bit 4 would alias 0x11 onto 0x01, 0x12 onto 0x02 and so on.
     this.crtc = new Uint8Array(0x40);
     this.seqIndex = 0;
-    this.seq = new Uint8Array(0x10);
+    // Room for an SVGA's extended registers (see cirrus.js); a plain VGA
+    // simply never uses the upper ones.
+    this.seq = new Uint8Array(0x20);
     this.gcIndex = 0;
-    this.gc = new Uint8Array(0x10);
+    this.gc = new Uint8Array(0x40);
     this.attrIndex = 0;
     this.attrFlipFlop = false;
     this.attr = new Uint8Array(0x20);
@@ -143,18 +161,27 @@ export class VGA {
     this.setDefaultPalette();
     this.dirty = true;
 
+    // The standard VESA numbers mean what VBE 1.2 says they mean: a driver
+    // of that age (Windows 95's Super VGA) sets 0x112 for 24-bit colour without
+    // asking.  32 bits per pixel has no standard number, so those modes are at
+    // 0x140 up, where VBE 2.0 software finds them by reading the mode info.
     this.vbeModes = new Map([
       [0x100, { w: 640, h: 400, bpp: 8 }],
       [0x101, { w: 640, h: 480, bpp: 8 }],
       [0x103, { w: 800, h: 600, bpp: 8 }],
       [0x105, { w: 1024, h: 768, bpp: 8 }],
-      [0x110, { w: 640, h: 480, bpp: 16 }],
+      [0x110, { w: 640, h: 480, bpp: 15 }],
       [0x111, { w: 640, h: 480, bpp: 16 }],
-      [0x112, { w: 640, h: 480, bpp: 32 }],
+      [0x112, { w: 640, h: 480, bpp: 24 }],
+      [0x113, { w: 800, h: 600, bpp: 15 }],
       [0x114, { w: 800, h: 600, bpp: 16 }],
-      [0x115, { w: 800, h: 600, bpp: 32 }],
+      [0x115, { w: 800, h: 600, bpp: 24 }],
+      [0x116, { w: 1024, h: 768, bpp: 15 }],
       [0x117, { w: 1024, h: 768, bpp: 16 }],
-      [0x118, { w: 1024, h: 768, bpp: 32 }],
+      [0x118, { w: 1024, h: 768, bpp: 24 }],
+      [0x140, { w: 640, h: 480, bpp: 32 }],
+      [0x141, { w: 800, h: 600, bpp: 32 }],
+      [0x142, { w: 1024, h: 768, bpp: 32 }],
     ]);
   }
 
@@ -190,6 +217,7 @@ export class VGA {
     for (const p of this.planes) p.fill(0);
     this.latch.fill(0);
     this.setDefaultPalette();
+    this.cirrus?.reset();
     this.dirty = true;
 
     // The 0xA0000 window routing follows the graphics controller, which has
@@ -224,6 +252,8 @@ export class VGA {
       this.onUnsupportedMode?.(mode);
     }
     const m = known ?? BIOS_MODES.get(0x03);
+    // A standard mode set leaves any SVGA mode, as the BIOS's does.
+    if (this.cirrus) { this.seq[0x07] = 0; this.cirrus.hiddenDac = 0; }
     this.biosMode = mode;
     this.mode = { ...m };
     this.lfbEnabled = false;
@@ -258,7 +288,12 @@ export class VGA {
 
   /** Planar modes need the CPU's writes to the window, other modes do not. */
   updateWindowRouting() {
-    this.onWindowRouting(!!this.mode.planar);
+    // 2 also routes the SVGA's BitBLT registers at 0xB8000, where Windows XP's
+    // Cirrus driver puts them; left as memory, every fill and copy it started
+    // vanished into the text buffer and windows were drawn without backgrounds.
+    const regs = !!this.cirrus?.mmioAtB8000();
+    const on = !!this.mode.planar || !!this.cirrus?.wantsWindow() || this.lfbEnabled;
+    this.onWindowRouting(regs ? 2 : on ? 1 : 0);
   }
 
   // ---- deriving the mode from the registers -------------------------------
@@ -275,6 +310,25 @@ export class VGA {
 
   recomputeFromRegisters() {
     if (this.lfbEnabled) return;            // a VBE mode owns the display
+    // An SVGA mode is described by the chip's own registers.
+    const ext = this.cirrus?.mode();
+    if (ext) {
+      const m = this.mode;
+      if (!m.cirrus || m.w !== ext.w || m.h !== ext.h || m.bpp !== ext.bpp ||
+          m.pitch !== ext.pitch || m.linear !== ext.linear) {
+        const sizeChanged = !m.cirrus || m.w !== ext.w || m.h !== ext.h || m.bpp !== ext.bpp;
+        this.mode = ext;
+        this.updateWindowRouting();
+        this.dirty = true;
+        if (sizeChanged) this.onModeChange?.(this.describe());
+      }
+      return;
+    }
+    if (this.mode.cirrus) {
+      // just left an SVGA mode: fall through to the standard derivation, but
+      // make sure it does not mistake the old geometry for the new
+      this.mode = { text: true, cols: this.textCols, rows: this.textRows, stale: true };
+    }
     const graphics = (this.gc[6] & 0x01) !== 0;
     const cols = (this.crtc[1] || 79) + 1;
     const dots = (this.seq[1] & 0x01) ? 8 : 9;
@@ -350,6 +404,7 @@ export class VGA {
     if (!info) return false;
     this.currentVbeMode = mode;
     this.lfbEnabled = true;
+    this.vbeBank = 0;
     this.mode = { text: false, w: info.w, h: info.h, bpp: info.bpp,
                   linear: this.lfbBase };
     this.dispi[DISPI_XRES] = info.w;
@@ -373,7 +428,18 @@ export class VGA {
   //  Writes pass through the graphics controller: the map mask picks planes,
   //  set/reset can substitute a colour, an ALU op combines with the latches
   //  and the bit mask decides which bits of the result survive.
+  /** VBE window A: which 64 KiB of video memory 0xA0000 shows. */
+  setVbeBank(bank) {
+    this.vbeBank = bank & 0xff;
+  }
+
+  vbeWindowAddr(offset) {
+    return this.lfbBase + ((this.vbeBank * 0x10000 + (offset & 0xffff)) % this.memSize);
+  }
+
   windowWrite(offset, value) {
+    if (this.cirrus?.wantsWindow() && !this.mode.planar) { this.cirrus.windowWrite(offset, value & 0xff); return; }
+    if (this.lfbEnabled) { this.m.u8[this.vbeWindowAddr(offset)] = value & 0xff; return; }
     offset &= VGA_WINDOW_SIZE - 1;
     value &= 0xff;
     const mode = this.gc[5] & 3;
@@ -415,6 +481,8 @@ export class VGA {
   }
 
   windowRead(offset) {
+    if (this.cirrus?.wantsWindow() && !this.mode.planar) return this.cirrus.windowRead(offset);
+    if (this.lfbEnabled) return this.m.u8[this.vbeWindowAddr(offset)];
     offset &= VGA_WINDOW_SIZE - 1;
     for (let p = 0; p < 4; p++) this.latch[p] = this.planes[p][offset];
     if ((this.gc[5] >> 3) & 1) {
@@ -443,20 +511,32 @@ export class VGA {
       case 0x3c1: return this.attr[this.attrIndex & 0x1f];
       case 0x3c2: return 0x10;                        // input status 0
       case 0x3c4: return this.seqIndex;
-      case 0x3c5: return this.seq[this.seqIndex & 0x0f];
-      case 0x3c6: return 0xff;                        // DAC pixel mask
-      case 0x3c7: return 0;
-      case 0x3c8: return this.dacWriteIndex;
+      case 0x3c5: {
+        const ext = this.cirrus?.readSeq(this.seqIndex);
+        if (ext !== undefined && ext !== null) return ext;
+        return this.seq[this.seqIndex & 0x0f];
+      }
+      case 0x3c6: return this.cirrus ? this.cirrus.readPel() : 0xff;   // pixel mask
+      case 0x3c7: this.cirrus?.dacTouched(); return 0;
+      case 0x3c8: this.cirrus?.dacTouched(); return this.dacWriteIndex;
       case 0x3c9: {
+        this.cirrus?.dacTouched();
         const v = this.palette[(this.dacReadIndex * 3 + this.dacLatch) % 768];
         if (++this.dacLatch === 3) { this.dacLatch = 0; this.dacReadIndex++; }
         return v;
       }
       case 0x3cc: return this.miscOutput;
       case 0x3ce: return this.gcIndex;
-      case 0x3cf: return this.gc[this.gcIndex & 0x0f];
+      case 0x3cf: {
+        const ext = this.cirrus?.readGc(this.gcIndex);
+        if (ext !== undefined && ext !== null) return ext;
+        return this.gc[this.gcIndex & 0x0f];
+      }
       case 0x3b4: case 0x3d4: return this.crtcIndex;
-      case 0x3b5: case 0x3d5: return this.crtc[this.crtcIndex & 0x3f];
+      case 0x3b5: case 0x3d5:
+        // without an SVGA, the chip ID register reads as nothing
+        if (!this.cirrus && (this.crtcIndex & 0x3f) === 0x27) return 0;
+        return this.crtc[this.crtcIndex & 0x3f];
       case 0x3ba: case 0x3da:
         // Reading status 1 resets the attribute flip-flop.  The retrace bits
         // are toggled so polling loops make progress.
@@ -495,14 +575,22 @@ export class VGA {
       case 0x3c2: this.miscOutput = val; return;
       case 0x3c4: this.seqIndex = val; return;
       case 0x3c5:
+        if (this.cirrus?.writeSeq(this.seqIndex, val)) return;
         this.seq[this.seqIndex & 0x0f] = val;
         if ((this.seqIndex & 0x0f) === 1 || (this.seqIndex & 0x0f) === 4) {
           this.recomputeFromRegisters();
         }
         return;
-      case 0x3c7: this.dacReadIndex = val; this.dacLatch = 0; return;
-      case 0x3c8: this.dacWriteIndex = val; this.dacLatch = 0; return;
+      case 0x3c6: this.cirrus?.writePel(val); return;
+      case 0x3c7: this.cirrus?.dacTouched(); this.dacReadIndex = val; this.dacLatch = 0; return;
+      case 0x3c8: this.cirrus?.dacTouched(); this.dacWriteIndex = val; this.dacLatch = 0; return;
       case 0x3c9: {
+        this.cirrus?.dacTouched();
+        if (this.cirrus?.dacExtended(this.dacWriteIndex, this.dacLatch, val)) {
+          if (++this.dacLatch === 3) { this.dacLatch = 0; this.dacWriteIndex++; }
+          this.dirty = true;
+          return;
+        }
         this.palette[(this.dacWriteIndex * 3 + this.dacLatch) % 768] = val & 0x3f;
         if (++this.dacLatch === 3) { this.dacLatch = 0; this.dacWriteIndex++; }
         this.dirty = true;
@@ -510,15 +598,18 @@ export class VGA {
       }
       case 0x3ce: this.gcIndex = val; return;
       case 0x3cf:
+        if (this.cirrus?.writeGc(this.gcIndex, val)) return;
         this.gc[this.gcIndex & 0x0f] = val;
         if ((this.gcIndex & 0x0f) === 6) this.recomputeFromRegisters();
         return;
       case 0x3b4: case 0x3d4: this.crtcIndex = val; return;
       case 0x3b5: case 0x3d5: {
         const i = this.crtcIndex & 0x3f;
+        if (this.cirrus?.writeCrtc(i, val)) return;
         this.crtc[i] = val;
         this.dirty = true;
-        if (i === 1 || i === 7 || i === 9 || i === 0x12) this.recomputeFromRegisters();
+        if (i === 1 || i === 7 || i === 9 || i === 0x12 ||
+            (this.cirrus && (i === 0x0c || i === 0x0d || i === 0x13))) this.recomputeFromRegisters();
         return;
       }
       default: return;
@@ -532,6 +623,7 @@ export class VGA {
     if (i === DISPI_ENABLE) {
       if (val & 1) {
         this.lfbEnabled = (val & 0x40) !== 0 || true;
+        this.vbeBank = 0;
         this.mode = {
           text: false,
           w: this.dispi[DISPI_XRES] || 640,
@@ -542,6 +634,7 @@ export class VGA {
       } else {
         this.setBiosMode(0x03);
       }
+      this.updateWindowRouting();
       this.dirty = true;
       this.onModeChange?.(this.describe());
     }
@@ -567,38 +660,56 @@ export class VGA {
    */
   renderGraphics(rgba) {
     if (this.mode.planar) return this.renderPlanar(rgba);
+    this.renderLinear(rgba);
+    if (this.mode.cirrus) this.cirrus.drawCursor(rgba, this.mode.w, this.mode.h);
+  }
+
+  renderLinear(rgba) {
     const { w, h, bpp, linear } = this.mode;
-    const src = this.m.readBytes(linear, w * h * Math.max(1, bpp >> 3));
+    // Scan lines may be padded past the visible width; a mode that says so
+    // carries its own pitch.
+    const bytesPP = bpp === 15 ? 2 : Math.max(1, bpp >> 3);
+    const pitch = this.mode.pitch ?? w * bytesPP;
+    const src = this.m.readBytes(linear, pitch * (h - 1) + w * bytesPP);
+    const out = new Uint32Array(rgba.buffer, rgba.byteOffset, w * h);
     let o = 0;
     if (bpp === 8) {
-      for (let i = 0; i < w * h; i++) {
-        const c = src[i] * 3;
-        rgba[o++] = this.palette[c] << 2;
-        rgba[o++] = this.palette[c + 1] << 2;
-        rgba[o++] = this.palette[c + 2] << 2;
-        rgba[o++] = 255;
+      const lut = new Uint32Array(256);
+      for (let c = 0; c < 256; c++) {
+        lut[c] = ((this.palette[c * 3] << 2) | ((this.palette[c * 3 + 1] << 2) << 8) |
+                  ((this.palette[c * 3 + 2] << 2) << 16) | 0xff000000) >>> 0;
       }
-    } else if (bpp === 16) {
-      for (let i = 0; i < w * h; i++) {
-        const v = src[i * 2] | (src[i * 2 + 1] << 8);
-        rgba[o++] = ((v >> 11) & 0x1f) << 3;
-        rgba[o++] = ((v >> 5) & 0x3f) << 2;
-        rgba[o++] = (v & 0x1f) << 3;
-        rgba[o++] = 255;
+      for (let y = 0; y < h; y++) {
+        let s = y * pitch;
+        for (let x = 0; x < w; x++) out[o++] = lut[src[s++]];
+      }
+    } else if (bpp === 15 || bpp === 16) {
+      const five = bpp === 15;
+      for (let y = 0; y < h; y++) {
+        let s = y * pitch;
+        for (let x = 0; x < w; x++, s += 2) {
+          const v = src[s] | (src[s + 1] << 8);
+          let r, g, b;
+          if (five) { r = (v >> 10) & 0x1f; g = ((v >> 5) & 0x1f) << 1; b = v & 0x1f; }
+          else { r = (v >> 11) & 0x1f; g = (v >> 5) & 0x3f; b = v & 0x1f; }
+          // Replicating the top bits fills the low ones, so full scale is 255.
+          out[o++] = (((r << 3) | (r >> 2)) | (((g << 2) | (g >> 4)) << 8) |
+                      (((b << 3) | (b >> 2)) << 16) | 0xff000000) >>> 0;
+        }
       }
     } else if (bpp === 24) {
-      for (let i = 0; i < w * h; i++) {
-        rgba[o++] = src[i * 3 + 2];
-        rgba[o++] = src[i * 3 + 1];
-        rgba[o++] = src[i * 3];
-        rgba[o++] = 255;
+      for (let y = 0; y < h; y++) {
+        let s = y * pitch;
+        for (let x = 0; x < w; x++, s += 3) {
+          out[o++] = (src[s + 2] | (src[s + 1] << 8) | (src[s] << 16) | 0xff000000) >>> 0;
+        }
       }
     } else {
-      for (let i = 0; i < w * h; i++) {
-        rgba[o++] = src[i * 4 + 2];
-        rgba[o++] = src[i * 4 + 1];
-        rgba[o++] = src[i * 4];
-        rgba[o++] = 255;
+      for (let y = 0; y < h; y++) {
+        let s = y * pitch;
+        for (let x = 0; x < w; x++, s += 4) {
+          out[o++] = (src[s + 2] | (src[s + 1] << 8) | (src[s] << 16) | 0xff000000) >>> 0;
+        }
       }
     }
   }
@@ -611,22 +722,37 @@ export class VGA {
   renderPlanar(rgba) {
     const { w, h } = this.mode;
     const stride = w >> 3;
-    const planes = this.planes;
+    const [p0, p1, p2, p3] = this.planes;
+    // The sixteen colours, resolved through the attribute palette and the DAC
+    // once per frame rather than once per pixel, as whole RGBA words.
+    const colours = new Uint32Array(16);
+    const bytes = new Uint8Array(colours.buffer);
+    for (let i = 0; i < 16; i++) {
+      const dac = (this.attr[i] & 0x3f) * 3;
+      bytes[i * 4] = this.palette[dac] << 2;
+      bytes[i * 4 + 1] = this.palette[dac + 1] << 2;
+      bytes[i * 4 + 2] = this.palette[dac + 2] << 2;
+      bytes[i * 4 + 3] = 255;
+    }
+    const out = new Uint32Array(rgba.buffer, rgba.byteOffset, w * h);
+    const spread = PLANE_SPREAD;
     let o = 0;
     for (let y = 0; y < h; y++) {
       const row = y * stride;
-      for (let x = 0; x < w; x++) {
-        const byte = row + (x >> 3);
-        const bit = 7 - (x & 7);
-        const idx = (((planes[0][byte] >> bit) & 1)) |
-                    (((planes[1][byte] >> bit) & 1) << 1) |
-                    (((planes[2][byte] >> bit) & 1) << 2) |
-                    (((planes[3][byte] >> bit) & 1) << 3);
-        const dac = (this.attr[idx] & 0x3f) * 3;
-        rgba[o++] = this.palette[dac] << 2;
-        rgba[o++] = this.palette[dac + 1] << 2;
-        rgba[o++] = this.palette[dac + 2] << 2;
-        rgba[o++] = 255;
+      for (let bx = 0; bx < stride; bx++) {
+        const i = row + bx;
+        // Eight 4-bit colour indices at once, pixel 0 in the low nibble.
+        const nib = spread[p0[i]] | (spread[p1[i]] << 1) |
+                    (spread[p2[i]] << 2) | (spread[p3[i]] << 3);
+        out[o] = colours[nib & 15];
+        out[o + 1] = colours[(nib >>> 4) & 15];
+        out[o + 2] = colours[(nib >>> 8) & 15];
+        out[o + 3] = colours[(nib >>> 12) & 15];
+        out[o + 4] = colours[(nib >>> 16) & 15];
+        out[o + 5] = colours[(nib >>> 20) & 15];
+        out[o + 6] = colours[(nib >>> 24) & 15];
+        out[o + 7] = colours[nib >>> 28];
+        o += 8;
       }
     }
   }

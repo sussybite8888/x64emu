@@ -17,6 +17,7 @@
 import { buildAcpiTables } from './acpi.js';
 import { FONT_8X16, FONT_HEIGHT } from './font.js';
 import { EGA_DAC, DEFAULT_DAC } from './vga.js';
+import { CIRRUS_MODES } from './cirrus.js';
 import { Disk, DISK_CDROM, DISK_FLOPPY, DISK_HDD, SliceStore, parseElTorito, NEED_DATA }
   from './disk.js';
 
@@ -181,6 +182,10 @@ const IRQ_HANDLERS = [
 const VGA_ROM_OFF = 0x2000;
 const VGA_PARAMS_OFF = 0x2100;        // a 69-byte block per mode
 const VGA_DAC_OFF = 0x2300;           // the EGA and 256-colour DAC tables
+// The far-callable bank switch VBE mode info points at (WinFuncPtr): the
+// same as INT 10h AX=4F05h, for drivers that call it directly.
+const VBE_WINFUNC_OFF = 0x2800;
+const VBE_WINFUNC = [0xb8, 0x05, 0x4f, 0xcd, 0x10, 0xcb];   // mov ax,4F05h; int 10h; retf
 
 const VGA_SET_MODE = [                // AX = parameter block; bit 15: keep memory
   0x1e,                             //  push  ds
@@ -605,12 +610,14 @@ export class BIOS {
     m.wr8(BDA + 0x75, this.disks.filter((d) => d.kind === DISK_HDD).length);
 
     this.programPic();
+    this.programLapic();
 
     // VBE data that callers receive far pointers to
     const oem = 'x64emu VGA\0';
     for (let i = 0; i < oem.length; i++) {
       m.wr8(ROM_BASE + OEM_STRING_OFF + i, oem.charCodeAt(i));
     }
+    m.writeBytes(ROM_BASE + VBE_WINFUNC_OFF, new Uint8Array(VBE_WINFUNC));
     let p = ROM_BASE + MODE_LIST_OFF;
     for (const mode of (this.emu.vga?.vbeModes.keys() ?? [])) { m.wr16(p, mode); p += 2; }
     m.wr16(p, 0xffff);
@@ -641,6 +648,24 @@ export class BIOS {
       pic.io(p8 + 1, 1, 0x01, true);             // ICW4: 8086 mode
       pic.io(p8 + 1, 1, 0x00, true);             // OCW1: unmask everything
     }
+  }
+
+  /**
+   * Leave the local APIC in virtual wire mode, as the MP specification asks
+   * of a BIOS and SeaBIOS does: software enabled, LINT0 taking the 8259's
+   * output as ExtINT, LINT1 as NMI.
+   *
+   * A system that turns the APIC on without programming LINT0 itself relies
+   * on this.  TempleOS does exactly that; left with LINT0 masked from reset,
+   * it never saw another timer tick, and the first timeout it waited for --
+   * probing an empty IDE slot for its boot CD -- never came.
+   */
+  programLapic() {
+    const l = this.emu.lapic;
+    if (!l) return;
+    l.write(0x0f0, 4, l.read(0x0f0) | 0x100);    // SVR: APIC enabled
+    l.write(0x350, 4, 0x8700);                   // LINT0: ExtINT, level
+    l.write(0x360, 4, 0x0400);                   // LINT1: NMI
   }
 
   /** Point the CPU at the boot trampoline in real mode. */
@@ -869,6 +894,10 @@ export class BIOS {
     switch (ah) {
       case 0x00: {                                   // set video mode
         const mode = this.r8lo(RAX) & 0x7f;
+        if (this.emu.cirrus && CIRRUS_MODES.has(mode)) {
+          this.cirrusSetMode(mode, (this.r8lo(RAX) & 0x80) === 0);
+          return;
+        }
         const params = VGA_PARAMS.get(mode);
         if (params && this.m.vm) {
           // From a virtual-8086 machine the registers are set by ROM code, so
@@ -967,6 +996,7 @@ export class BIOS {
         }
         return;
       case 0x12:                                     // alternate select
+        if (this.emu.cirrus && this.r8lo(RBX) >= 0x80) return this.cirrusExtension();
         this.setR8lo(RBX, 0x03);
         return;
       case 0x13: {                                   // write string
@@ -1143,6 +1173,89 @@ export class BIOS {
     if (up) this.scrollUp(lines);
   }
 
+  // ---- Cirrus Logic BIOS extensions -------------------------------------
+  //  What a GD5446's own video BIOS adds.  Windows' cirrus.sys asks through
+  //  these which chip it has and how much memory, which modes are there, and
+  //  then sets them by number with AH=00h.  Functions it may call that only
+  //  tune a monitor (refresh rates, sync polarity) are accepted and ignored.
+  cirrusExtension() {
+    const bl = this.r8lo(RBX);
+    const c = this.emu.cirrus;
+    switch (bl) {
+      case 0x80:                                     // which chip
+        this.setR8lo(RAX, 0x39);                     // CL-GD5446
+        this.setR8hi(RAX, 0xaf);
+        return;
+      case 0x81:                                     // BIOS version
+        this.setR16(RAX, 0x0100);
+        return;
+      case 0x82:                                     // chip revision
+        this.setR8lo(RAX, (this.emu.vga.crtc[0x27] & 0x03) | 0x04);
+        return;
+      case 0x85:                                     // memory, in 64 KiB units
+        this.setR8lo(RAX, c.vramSize >> 16);
+        return;
+      case 0x9a:                                     // user options
+        this.setR16(RAX, 0x4060);
+        this.setR16(RCX, 0x1132);
+        return;
+      case 0xa0: {                                   // is this mode available?
+        const mode = this.r8lo(RAX) & 0x7f;
+        const m = CIRRUS_MODES.get(mode);
+        const fits = m && m.w * m.h * (m.bpp === 15 ? 2 : m.bpp >> 3) <= c.vramSize;
+        this.setR8hi(RAX, fits ? 0x01 : 0x00);
+        this.setR16(RSI, 0xffff);
+        return;
+      }
+      case 0xa1:                                     // monitor type
+        this.setR16(RBX, 0x0e00);
+        return;
+      default:                                       // refresh rate and the like
+        return;
+    }
+  }
+
+  /**
+   * Set a Cirrus extended mode by programming the chip, as its BIOS would:
+   * a 256-colour style graphics setup with the CRTC for the resolution, the
+   * pitch and pixel format in the extended registers, and memory cleared.
+   */
+  cirrusSetMode(mode, clear) {
+    const vga = this.emu.vga;
+    const c = this.emu.cirrus;
+    const { w, h, bpp } = CIRRUS_MODES.get(mode);
+    const bytes = bpp === 15 ? 2 : bpp >> 3;
+    const pitch = w * bytes;
+    vga.lfbEnabled = false;
+    vga.dispi[4] = 0;
+    // the standard part: graphics, chain-4, 256-colour attribute mode
+    vga.miscOutput = 0xe3;
+    vga.seq[1] = 0x01; vga.seq[2] = 0x0f; vga.seq[3] = 0x00; vga.seq[4] = 0x0e;
+    vga.gc[5] = 0x40; vga.gc[6] = 0x05; vga.gc[8] = 0xff;
+    vga.attr[0x10] = 0x41;
+    for (let i = 0; i < 16; i++) vga.attr[i] = i;
+    const cr = vga.crtc;
+    const vde = h - 1;
+    cr[0x01] = (w >> 3) - 1;
+    cr[0x12] = vde & 0xff;
+    cr[0x07] = (cr[0x07] & ~0x42) | ((vde >> 7) & 0x02) | ((vde >> 3) & 0x40);
+    cr[0x09] = 0x00;
+    cr[0x13] = (pitch >> 3) & 0xff;
+    cr[0x1b] = 0x22 | (((pitch >> 3) >> 4) & 0x10);
+    cr[0x0c] = 0; cr[0x0d] = 0; cr[0x1d] = 0; cr[0x1a] = 0;
+    cr[0x14] = 0x00; cr[0x17] = 0xc3;
+    // the extended part
+    vga.seq[0x07] = 0x01 | ({ 8: 0x00, 15: 0x06, 16: 0x06, 24: 0x04, 32: 0x08 }[bpp]);
+    c.hiddenDac = { 8: 0x00, 15: 0xf0, 16: 0xe1, 24: 0xe5, 32: 0xe5 }[bpp];
+    vga.gc[0x09] = 0; vga.gc[0x0a] = 0; vga.gc[0x0b] = 0;
+    if (bpp === 8) vga.setDefaultPalette();
+    if (clear) this.m.u8.fill(0, vga.lfbBase, vga.lfbBase + pitch * h);
+    this.mem.wr8(BDA + 0x49, mode);
+    vga.biosMode = mode;
+    vga.recomputeFromRegisters();
+    vga.updateWindowRouting();
+  }
+
   // ---- VESA BIOS extensions ---------------------------------------------
   vbe() {
     const vga = this.emu.vga;
@@ -1175,19 +1288,26 @@ export class BIOS {
       const m = this.mem;
       for (let i = 0; i < 256; i++) m.wr8(at + i, 0);
       m.wr16(at + 0x00, 0x00bb);        // supported, colour, graphics, LFB
+      // Window A: 64 KiB at A000h in 64 KiB steps, for drivers that predate
+      // the linear framebuffer and reach video memory a bank at a time.
+      m.wr8(at + 0x02, 0x07);           // window A exists, readable, writable
+      m.wr16(at + 0x04, 64);            // granularity, KiB
+      m.wr16(at + 0x06, 64);            // size, KiB
+      m.wr16(at + 0x08, 0xa000);        // segment
+      m.wr32(at + 0x0c, (ROM_SEG << 16) | VBE_WINFUNC_OFF);
       m.wr8(at + 0x19, info.bpp);
       m.wr8(at + 0x1b, info.bpp === 8 ? 4 : 6);   // memory model: packed / direct
       m.wr16(at + 0x12, info.w);
       m.wr16(at + 0x14, info.h);
-      m.wr16(at + 0x10, info.w * (info.bpp >> 3)); // bytes per scan line
+      const bytes = info.bpp === 15 ? 2 : info.bpp >> 3;
+      m.wr16(at + 0x10, info.w * bytes);  // bytes per scan line
       m.wr8(at + 0x1c, 1);              // number of planes
       m.wr8(at + 0x1d, 1);              // banks
       m.wr32(at + 0x28, vga.lfbBase);   // physical address of the framebuffer
-      if (info.bpp === 32 || info.bpp === 24) {
-        m.wr8(at + 0x1f, 8); m.wr8(at + 0x20, 16);   // red
-        m.wr8(at + 0x21, 8); m.wr8(at + 0x22, 8);    // green
-        m.wr8(at + 0x23, 8); m.wr8(at + 0x24, 0);    // blue
-      }
+      // the direct colour layout: size and position of red, green, blue
+      const masks = { 15: [5, 10, 5, 5, 5, 0], 16: [5, 11, 6, 5, 5, 0],
+                      24: [8, 16, 8, 8, 8, 0], 32: [8, 16, 8, 8, 8, 0] }[info.bpp];
+      if (masks) masks.forEach((v, i) => m.wr8(at + 0x1f + i, v));
       this.setR16(RAX, 0x004f);
       return;
     }
@@ -1207,6 +1327,15 @@ export class BIOS {
       }
       const ok = vga.setVbeMode(mode, (bx & 0x4000) !== 0);
       this.setR16(RAX, ok ? 0x004f : 0x014f);
+      return;
+    }
+
+    if (al === 0x05) {                                // window control
+      const bh = this.r8hi(RBX);
+      if (this.r8lo(RBX) !== 0) { this.setR16(RAX, 0x014f); return; }   // only window A
+      if (bh === 0x00) vga.setVbeBank(this.r16(RDX));
+      else this.setR16(RDX, vga.vbeBank);
+      this.setR16(RAX, 0x004f);
       return;
     }
 
@@ -1385,6 +1514,18 @@ export class BIOS {
     }
   }
 
+  /**
+   * Where the usable RAM above 1 MiB ends, as the E820 map has it.  E801 and
+   * 88h must agree with E820: the top of guest RAM is the framebuffer and the
+   * BitBLT aperture, and a guest that sizes memory by E801 and believes it --
+   * TempleOS takes the larger of the two -- puts its heap there, where writes
+   * land in video memory or the blitter instead of staying put.
+   */
+  extendedEnd() {
+    const r = this.e820.find((e) => e.type === 1 && e.base === 0x100000);
+    return r ? r.base + r.size : this.emu.ramSize;
+  }
+
   // ---- INT 15h: miscellaneous system services ----------------------------
   int15() {
     const ah = this.r8hi(RAX);
@@ -1411,7 +1552,7 @@ export class BIOS {
     }
 
     if (ax === 0xe801) {                             // extended memory size
-      const kb = Math.floor((this.emu.ramSize - 0x100000) / 1024);
+      const kb = Math.floor((this.extendedEnd() - 0x100000) / 1024);
       const below16 = Math.min(kb, 15 * 1024);
       const above16 = Math.max(0, Math.floor((kb - 15 * 1024) / 64));
       this.setR16(RAX, below16);
@@ -1424,7 +1565,7 @@ export class BIOS {
 
     switch (ah) {
       case 0x88: {                                   // extended memory, KiB
-        const kb = Math.min(0xffff, Math.floor((this.emu.ramSize - 0x100000) / 1024));
+        const kb = Math.min(0xffff, Math.floor((this.extendedEnd() - 0x100000) / 1024));
         this.setR16(RAX, kb);
         this.setReturnCarry(false);
         return;

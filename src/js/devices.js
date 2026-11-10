@@ -545,6 +545,7 @@ export class IOBus {
   reset() {
     this.pic.reset();
     this.pit.reset();
+    this.pci.reset();
     this.cmos.resetInterrupts();
     this.acpi.pm1Status = 0;
     this.acpi.pm1Enable = 0;

@@ -1,6 +1,6 @@
 // Headless boot harness: load a kernel, run it, stream the serial console.
 //
-//   node tools/boot.mjs images/tinycore-vmlinuz [images/initrd.gz] [--slices N]
+//   node tools/boot.mjs images/tinycore-vmlinuz [images/initrd.gz] [--slices N] [--jit off]
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -17,7 +17,7 @@ for (let i = 0; i < args.length; i++) {
 
 const kernelPath = files[0] ?? join(root, 'images', 'tinycore-vmlinuz');
 const initrdPath = files[1] ?? null;
-const maxSlices = Number(flags.slices ?? 4000);
+const maxSlices = Number(flags.slices ?? 30000);
 // sizes may be given as 512M, 8G, ... with no upper bound
 const parseSize = (v, d) => {
   if (!v) return d;
@@ -30,7 +30,8 @@ const ramSize = parseSize(flags.ram, 256 * 1024 * 1024);
 const cmdline = flags.cmdline ??
   'console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 loglevel=7 nokaslr';
 
-const emu = new Emulator({ ramSize, sliceSize: 2_000_000 });
+// --jit off runs everything through the interpreter
+const emu = new Emulator({ ramSize, sliceSize: 2_000_000, jit: flags.jit !== 'off' });
 await emu.init(readFileSync(join(root, 'build', 'cpu.wasm')));
 
 let line = '';

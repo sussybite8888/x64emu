@@ -1,9 +1,11 @@
 # x64emu
 
 An x86-64 CPU emulator written in **WebAssembly text format (WAT)**, with a
-JavaScript platform around it — VGA adapter, virtual BIOS, ATA controller,
-PS/2 keyboard, interrupt controllers, timer, UART, RTC — and an HTML front end
-with a canvas display. It boots real, unmodified bootable images.
+JIT that compiles hot guest code to WebAssembly at run time, a JavaScript
+platform around it — a Cirrus Logic SVGA, virtual BIOS, ATA controller, PS/2
+keyboard and mouse, interrupt controllers, timer, UART, RTC — and an HTML front
+end that runs the machine in a Web Worker and shows it on a canvas. It boots
+real, unmodified bootable images, and Windows XP runs on it in 24-bit colour.
 
 Guest RAM, disk size and image size are all unbounded by design: RAM lives in
 its own 64-bit WebAssembly memory, the RAM drive allocates only what is written,
@@ -11,7 +13,8 @@ and images are read in pieces as the guest asks for them.
 
 ```
 src/wat/     the CPU core, hand-written WAT, assembled into one module
-src/js/      machine glue, devices, VGA, BIOS, boot protocols, browser UI
+src/js/      machine glue, devices, VGA and SVGA, BIOS, boot protocols, the JIT,
+             browser UI and the worker the machine runs in
 tests/       assembly test programs + Node runners
 tools/       headless boot harnesses
 build.sh     concatenates the WAT fragments and runs wat2wasm
@@ -30,12 +33,30 @@ node tools/bootimg.mjs path/to/image.iso --ram 8G --hdd 256G
 node tools/boot.mjs path/to/vmlinuz path/to/initrd.gz
 
 # browser
-python3 -m http.server 8000     # then open http://localhost:8000
+node tools/serve.mjs 8000       # then open http://localhost:8000
 ```
 
 The browser UI takes images from file pickers, so nothing needs to be bundled
 with the page. It offers two paths: **Boot image** runs an arbitrary bootable
 image under the BIOS, and **Boot kernel** enters a Linux kernel directly.
+**Reset** is the machine's reset button: the CPU, chipset, PCI configuration
+and display adapter go back to their power-on state and the same image boots
+again (or the same kernel is loaded again), with everything the guest wrote to
+its disks kept. It works whether the machine is running, paused or stopped.
+After a reset in the middle of a session Windows XP may offer its "Windows Error
+Recovery" menu; its default, Start Windows Normally, is the right choice.
+
+The machine runs in a Web Worker. On the page's own thread it could only run
+between animation frames — 12 ms of every 16.7, less whatever drawing took —
+and every other thing the page did came out of the guest's time. The worker
+runs it continuously and sends the screen across: rendered RGBA for graphics
+modes, the character cells for text. While the guest is idle (halted, or
+waiting in the BIOS for a key) its clock is held to real time rather than
+racing ahead, so its clock, timeouts and animations run at their proper speed.
+
+**JIT** (on by default) and **display** (the Cirrus SVGA, or a plain VGA with
+VBE) are chosen next to the RAM size. The headless tools take `--jit off` and
+`--display vga`.
 
 ## What actually runs
 
@@ -58,9 +79,13 @@ installation, the 8259/8254/16550/CMOS drivers, initramfs unpacking, the
 `SYSENTER` syscall fast path, ring 3, copy-on-write faults, and the dynamic
 loader plus libc in userspace.
 
-Speed is roughly **50 million instructions per second** in Node on an M-series
-Mac; a full boot to shell is about 1.5 billion instructions and takes around
-31 seconds. See [Performance](#performance) for what that took.
+With the JIT that boot takes about 8 seconds (around 150 million instructions
+per second, against 45 for the interpreter alone). Real operating systems
+gain less, because they spend more of their time in code that is only run a
+few times: Windows XP reaches its desktop about twice as fast, Debian its login
+prompt 2.3 times as fast, and an idle Windows 95 desktop runs at roughly 95
+MIPS where the interpreter managed 35. See [Performance](#performance) and
+[The JIT](#the-jit).
 
 ### Booting an arbitrary image
 
@@ -137,6 +162,14 @@ Menu, `HIMEM.SYS` with DOS loaded high, the 32-bit VMM and every VxD, the
 protected-mode IDE driver, the 16-bit kernel, and the display driver, and the
 mouse moves the pointer and clicks. An MS-DOS prompt opens in a window or full
 screen.
+
+It stays at 16 colours. This installation has no driver for any SVGA chip on
+its disk (no Cirrus files, and no cabinet files to install them from), and the
+BIOS offers no PCI BIOS, which is how Windows 95 would find a PCI card in the
+first place. Its generic **Super VGA** driver (`framebuf.drv`, VESA) does
+install from the files on the disk, but the restart into it stops at "Windows
+protection error": a divide error in a VxD, the timing-loop failure Windows 95
+is known for on fast processors. For more colours, use Windows XP.
 
 The mouse needed two things from the BIOS. The equipment word (`INT 11h`) has
 to report a pointing device, or Windows never looks for one. Windows then
@@ -234,8 +267,10 @@ the order the boot ran into them:
 
 ### Windows XP
 
-Windows XP Professional SP3 boots to its desktop at 640x480 in 16 colours, and
-the keyboard and mouse work. The disk image is 20 GiB of FAT32 that was installed
+Windows XP Professional SP3 boots to its desktop, and the keyboard and mouse
+work. It runs on its own driver for the emulated Cirrus Logic GD5446, at up to
+1024x768 in 24-bit colour (see [The Cirrus GD5446](#the-cirrus-gd5446)). The
+disk image is 20 GiB of FAT32 that was installed
 under QEMU with the "ACPI Uniprocessor PC" HAL. That disk had not been shut down
 cleanly, so the first boot goes through the Windows Error Recovery menu (it
 starts normally after 30 seconds) and `autochk`. `autochk` reads through the
@@ -271,8 +306,11 @@ disk path. The boot needed these, in order:
   to be below the ISA bridge. Declared at the root, they were started before
   the PCI bus, and `ACPI.sys` crashed (STOP 0x7E).
 
-There is no PCI display adapter for XP's own drivers, so it runs on its generic
-VGA driver.
+This image was installed on QEMU's standard VGA, for which XP has no driver,
+so it ran in 16 colours on the generic VGA driver. With the Cirrus card
+present, the first boot finds it, installs `cirrus.sys` and `cirrus.dll` from
+the driver cache already on the disk, and asks to restart. The next boot comes
+up at 640x480 in 24-bit colour, and Display Properties offers more.
 
 ### TempleOS
 
@@ -317,7 +355,30 @@ something. The version number printing as a long run of zeros is the missing
 floating point — HolyC uses doubles for every number, and there is no x87 or SSE
 arithmetic to convert them with.
 
-Give it `--ram 1G`; TempleOS asks for at least 512 MiB.
+It runs in the page's default 256 MiB, with about 130 MiB free.
+
+It stopped working twice as the rest of the machine grew, both times through
+what the BIOS leaves behind at POST:
+
+- **The local APIC.** TempleOS software-enables the APIC through SVR and
+  never touches LINT0, relying on the BIOS to have left it in *virtual wire
+  mode* (LINT0 = ExtINT), as the MP specification asks and SeaBIOS does. Once
+  the APIC was emulated, LINT0 stayed masked from reset, so the 8259's timer
+  never reached the CPU again. TempleOS's clock stood still and the first
+  timeout it waited on, probing the empty IDE slave for its boot CD, never
+  expired. POST now sets SVR, LINT0 and LINT1 the way SeaBIOS does.
+- **Memory size.** TempleOS sizes memory as the larger of `INT 15h E801` and
+  the E820 total. E801 (and 88h, and the CMOS) counted the top of RAM that
+  E820 reserves for the display, so its heap went into the Cirrus BitBLT
+  aperture, where writes do not stick, and it page-faulted in
+  `DskCacheInvalidate2` right after finding its CD. All three now stop where
+  E820's usable RAM does.
+
+TempleOS never halts; its window manager redraws continuously and the status
+bar reads CPU99. The page holds an idle guest's clock to real time, but a busy
+one runs as fast as instructions are executed, at 100 M instructions per
+virtual second. On a fast host TempleOS's clock and animations therefore run
+ahead of real time.
 
 Getting here turned up four real bugs, all now fixed:
 
@@ -476,7 +537,7 @@ trapping to the host per access.
 | --- | --- |
 | `0xB8000` | text mode character/attribute pairs |
 | `0xA0000` | 64 KiB window, linear in mode 13h |
-| top of RAM | linear framebuffer for the high-resolution modes |
+| top of RAM | 32 MiB, the SVGA's framebuffer BAR: 16 MiB of video memory, then the BitBLT aperture |
 
 - **Text modes** (`0x00`–`0x03`, `0x07`) render as glyphs on a canvas using the
   browser's monospace font, with code page 437 mapped for the box-drawing
@@ -489,8 +550,78 @@ trapping to the host per access.
   controller: map mask, set/reset, the rotate and logic ops, the bit mask and
   the four latches, in all four write modes and both read modes.
 - **High resolution** goes through the Bochs `dispi` register pair at
-  `0x01CE/0x01CF`, driven by the VBE calls (`INT 10h AX=4F00–4F03`) the BIOS
-  implements. Modes up to 1024x768x32 are offered, at 8, 16, 24 and 32 bpp.
+  `0x01CE/0x01CF`, driven by the VBE calls (`INT 10h AX=4F00–4F05`) the BIOS
+  implements. Modes up to 1024x768 are offered at 8, 15, 16, 24 and 32 bpp,
+  both through the linear framebuffer and a 64 KiB at a time through window A
+  at `0xA0000`, for drivers older than linear framebuffers. The standard VESA
+  numbers mean what VBE 1.2 says (`0x112` is 640x480 at 24 bits), because
+  drivers of that age set them without reading the mode info; 32-bit modes,
+  which have no standard number, are at `0x140`-`0x142`.
+- **SVGA modes** are the Cirrus GD5446's own, below.
+
+Graphics frames are rendered a word per pixel from lookup tables (eight planar
+pixels per step), which keeps a 640x480 planar frame under half a millisecond.
+
+### The Cirrus GD5446
+
+Windows XP has drivers for a handful of 1990s SVGA chips and for no generic
+framebuffer, so more than 16 colours under XP means emulating one of those
+chips well enough for its own driver. The Cirrus Logic CL-GD5446 is the
+simplest of them and the best documented, and `src/js/cirrus.js` emulates it
+on PCI at `00:02.0` with 4 MiB of video memory. It is the default display
+adapter.
+
+Tried with XP: it installs its driver on the first boot, comes up at
+640x480x24 after the restart, and Display Properties switches to 1024x768 at
+24 or 16 bits per pixel. Windows open, scroll and move, and menus, dialogs and
+the Luna theme draw correctly.
+
+XP's driver keeps the BitBLT registers in the chip's older window at
+`0xB8000` (SR17 = `0x24`) rather than in BAR1, and does every background fill
+and window scroll with the blitter: solid fills as a colour-expanded 8x8
+pattern of all ones it writes to off-screen memory once, XOR fills for the
+caret, and forward and backward copies. While `0xB8000` was ordinary memory,
+all of that was written into the text buffer and lost, and the status register
+read back "idle", so the driver never noticed: windows came up without
+backgrounds, see-through to whatever was underneath, until a menu or the
+classic theme repainted them some other way. The core now hands `0xB8000`
+to the chip while it is in an SVGA mode with that window enabled.
+
+What a Cirrus driver can use, and so what is there:
+
+- **The extended registers**: the sequencer, graphics controller and CRTC
+  beyond the VGA's, unlocked through SR6, the chip ID in CR27, and the memory
+  size where the driver looks for it.
+- **The hidden DAC register** behind four reads of `0x3C6`, which with SR7
+  chooses 8, 15, 16, 24 or 32 bits per pixel. The display geometry, pitch and
+  start address are read straight off the registers.
+- **The BitBLT engine**, which the display driver does most of its drawing
+  with: copies in both directions, the sixteen raster operations, 8x8 colour
+  and monochrome patterns, colour expansion from one bit per pixel,
+  transparency, solid fills, and host transfers, where the CPU writes the
+  source data into video memory and the engine takes it from there. Host data
+  is a continuous stream: monochrome lines a byte apart (a dword apart only
+  when GR33 asks), colour lines a dword apart. A transfer that expects more
+  than the driver sends never ends, and swallows every framebuffer write after
+  it. The registers are reachable through ports, through BAR1 (from offset
+  `0x100`; below that BAR1 mirrors the VGA ports) and through the window at
+  `0xB8000`.
+- **The hardware cursor**, 32x32 or 64x64, drawn over the frame.
+- **The video BIOS's extensions**: `INT 10h AH=12h` with BL=80h onwards (which
+  chip, how much memory, is this mode available) and the Cirrus mode numbers
+  through `AH=00h`.
+
+Video memory is guest RAM, as before, so the CPU draws at full speed. The
+framebuffer BAR is 32 MiB at the top of RAM: its first half is that memory,
+and the second half is the BitBLT aperture, which the core treats as I/O even
+though it lies inside RAM. During a host transfer the first half is treated
+as I/O too, so the driver's writes reach the engine. The ACPI root bridge
+declares the window, or XP decides the BAR is outside every bridge and moves
+it somewhere that is not memory.
+
+Linux's `cirrus-qemu` driver recognises the card by the subsystem IDs QEMU
+uses, which it carries for that reason. `display: 'vga'` leaves the card out
+and offers VBE alone.
 
 A mode the adapter cannot draw no longer falls back to text in silence — it says
 so on the console, because a guest happily drawing into a mode that is not being
@@ -552,6 +683,7 @@ disk booted from its MBR. Writes are rejected — images are read-only.
 | `60_exec.wat` | prefix decoding and one-byte opcode handlers |
 | `70_groups.wat` | group opcodes, string instructions, x87 stubs |
 | `80_0f.wat` | two-byte opcodes: CPUID, MSRs, CR access, bit ops, SSE moves |
+| `85_jit.wat` | the JIT's runtime: block cache, JIT TLB, code-page tracking, helpers |
 | `90_run.wat` | dispatch tables, step function, run loop, exports |
 
 Design notes:
@@ -669,11 +801,9 @@ platform surface, and it is substantial:
    each process's XMM registers apart. Debian 13 userspace runs on it (see
    [Debian](#debian)).
 5. **Performance.** At ~50 MIPS an Ubuntu boot would take on the order of an
-   hour. Reaching usable speed needs a JIT that translates basic blocks to
-   WebAssembly at run time, not an interpreter.
-
-Items 1–4 are each a well-understood, bounded piece of work. Item 5 is a
-different project.
+   hour. The JIT ([The JIT](#the-jit)) brings that down by two to three times;
+   more needs blocks to chain to each other without going back through the
+   run loop, which is now the largest single cost.
 
 ## Performance
 
@@ -764,7 +894,84 @@ Going materially faster needs that to stop being true:
   past that and a different project again.
 
 Neither is a tuning exercise, and both carry real regression risk against a test
-suite that currently passes in full.
+suite that currently passes in full. The second has since been built: see
+[The JIT](#the-jit).
+
+### The JIT
+
+`src/js/jit.js` compiles runs of guest instructions into WebAssembly functions,
+which the core reaches through its function table with one `call_indirect`.
+A first version existed already, but on a real operating system it was slower
+than the interpreter: its blocks were keyed by linear address, so every CR3
+load -- every task switch -- threw them all away. One Windows 95 boot flushed
+it 7,594 times, and 151 million of 156 million lookups missed.
+
+What it is now:
+
+- **Blocks are keyed by physical address**, plus what decides how their bytes
+  behave: the mode, virtual-8086, and the stack width. RIP is worked out
+  relative to wherever a block was entered, so the same code reached through
+  another mapping or CS base still runs, and a task switch costs nothing.
+- **Any instruction can be in a block.** The common integer instructions are
+  compiled inline; anything else the decoder can measure runs in the
+  interpreter, in place, and the block carries on if execution went where it
+  expected. Only bytes whose length it cannot work out end a block.
+- **Flags are deferred.** An arithmetic instruction leaves its operands in
+  locals. A conditional branch usually reads its condition from them directly
+  (CMP then JL is one signed compare), and the six flags are only produced at
+  a block exit, before the interpreter runs an instruction, or on the way out
+  of a fault, where they must be exactly what they were before it.
+- **Memory is inline.** Each access does the segment limit check and a lookup
+  in a 4,096-entry translation cache, the *JIT TLB*, in a few instructions and
+  calls into the core only on a miss. The interpreter uses the same cache in
+  place of its old one-entry ones.
+- **Blocks are superblocks.** A conditional branch is a side exit and the block
+  continues down the fall-through path; an unconditional jump within the page
+  is followed; a branch back to the block's own start becomes a WebAssembly
+  loop, which gives way to the run loop when its instruction budget runs out or
+  an interrupt is waiting.
+- **Code is tracked to the byte.** A bitmap marks every physical page with
+  compiled code, and no cached write translation exists for such a page, so a
+  store that could change code always reaches the core. The core keeps which
+  16-byte regions of the page blocks occupy; a store into one of those asks the
+  host, which keeps the exact bytes. Only a real hit bumps the page's
+  generation, which every block built from it was stamped with. That last
+  step mattered: Windows 95's VMM builds thunks inside structures it writes on
+  every interrupt, and at page or even 16-byte granularity it recompiled them
+  thousands of times a second.
+
+Two interpreter changes came out of the same work. `REP MOVS` and `REP STOS`,
+after one ordinary iteration has checked segments and faults, do as many
+more as fit in their pages at once, with `memory.copy` or `memory.fill`. One
+iteration per trip round the run loop had been a third of everything the
+interpreter still ran on the Windows 95 desktop; the copy benchmark went from
+about 0.4 GB/s to 19 GB/s. And a store to a device -- an APIC register, an
+interrupt controller port -- ends a compiled block, so interrupts it makes
+pending are taken before the next instruction, as the interpreter takes them.
+
+| | interpreter | JIT |
+| --- | ---: | ---: |
+| Tiny Core kernel to shell | 45 MIPS | 158 MIPS |
+| Windows 95, idle desktop | 35 MIPS | 95 MIPS |
+| Windows XP, boot to desktop | about 250 s | 118 s |
+| Debian 13, boot to login | 351 s | 152 s |
+| microbenchmarks (geometric mean) | | 3.0x |
+
+Getting it right on real guests turned up three bugs the test programs had not:
+
+- **A followed jump at the end of a full block** left for the bytes after the
+  jump instead of its target. XP blue-screened in `win32k.sys` a minute into its
+  boot, at the same instruction every time; disabling compiled features one
+  group at a time, in parallel boots, narrowed it to jump following in two
+  rounds.
+- **The `STI` shadow.** `sti; nop; cli` is how VMM opens a window for pending
+  interrupts: exactly one instruction runs with interrupts enabled. The block
+  after `STI` ran `nop` and `cli` together, the window never opened, and
+  Windows 95 waited with interrupts off for an event that needed one. The
+  instruction in the shadow is now interpreted on its own.
+- **`ctx.long`** was never set, so the compiler thought 64-bit code was 32-bit
+  when deciding which instructions it could take; `PUSH ES` compiled where the
+  CPU raises `#UD`. A long mode test program found it.
 
 ## Things that turned out to matter more than expected
 
@@ -817,6 +1024,14 @@ binary, and checks the guest's self-report on port `0xE9`.
 | `t_sse2int` | the SSE2 integer set glibc is built from, generated by `tests/gen_sse2int.py` |
 | `t_mmx` | every MMX form, and what MMX does to the x87 tags, TOP and `FXSAVE` image, generated by `tests/gen_mmx.py` |
 | `t_fxsave` | the `FXSAVE` layout and an exact round trip of x87 and XMM state |
+| `t_string` | also an overlapping forward copy, which must repeat a pattern rather than move it, and copies across many pages, for the bulk `REP` path |
+| `t_jit` | block edges: a followed jump in a full block, a side exit from one, a loop closed on its own entry, flags still deferred at a side exit |
+
+`tests/run_jit.mjs` runs every program twice, interpreted and with the JIT
+compiling at every instruction boundary, and requires the same final state
+and the program's own success report. `node tools/difftest/local.mjs --jit`
+runs the 30,000 instruction cases checked against real hardware through
+compiled code, one instruction to a block.
 
 The two generators take their expected values from a model of the manual, not
 from the emulator. Run with `--verify`, each builds the same cases into a native
@@ -844,6 +1059,10 @@ which hangs forever if any part of it is missing.
   32-bit data transfers, CHS geometry, and disks past 4 GiB
 - the local APIC, the I/O APIC and the RTC: self-IPIs, priority, EOI, edge and
   level pins, the timer firing on time, and the RTC's periodic interrupt
+- the Cirrus GD5446 the way `cirrus.sys` drives it: PCI identity and BAR
+  sizing, chip detection, the hidden DAC, an extended mode, BitBLT fills,
+  copies both ways, host-fed colour expansion and patterns, and the cursor in
+  the rendered frame; and VBE window A landing in the right bank
 
 ## Requirements
 

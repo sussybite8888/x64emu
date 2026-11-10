@@ -95,6 +95,11 @@
     (call $raise_gp (i64.const 0))
     (i32.const 0))
 
+  ;; Port I/O may change what interrupts are pending (an EOI, an unmask, a
+  ;; read that acknowledges), and the interpreter looks before the next
+  ;; instruction; a compiled block that ran one through j_step stops after it.
+  (func $io_mark (global.set $jit_exit (i32.const 1)))
+
   ;; jump target truncation for the current mode
   (func $jump_to (param $t i64)
     (if (i32.eq (global.get $mode) (i32.const 3))
@@ -691,9 +696,11 @@
                        (else (i32.const 1))))
     (if (i32.eqz (call $io_allowed (local.get $port) (local.get $size))) (then (return)))
     (if (i32.and (local.get $op) (i32.const 2))
-      (then (call $io_write (local.get $port) (local.get $size)
+      (then (global.set $jit_exit (i32.const 1))
+             (call $io_write (local.get $port) (local.get $size)
                             (i32.wrap_i64 (call $regN (i32.const 0) (local.get $size)))))
       (else (call $setregN (i32.const 0) (local.get $size)
+              (call $io_mark)
               (i64.extend_i32_u (call $io_read (local.get $port) (local.get $size)))))))
 
   (func $h_inout_dx (param $op i32)
@@ -705,9 +712,11 @@
                        (else (i32.const 1))))
     (if (i32.eqz (call $io_allowed (local.get $port) (local.get $size))) (then (return)))
     (if (i32.and (local.get $op) (i32.const 2))
-      (then (call $io_write (local.get $port) (local.get $size)
+      (then (global.set $jit_exit (i32.const 1))
+             (call $io_write (local.get $port) (local.get $size)
                             (i32.wrap_i64 (call $regN (i32.const 0) (local.get $size)))))
       (else (call $setregN (i32.const 0) (local.get $size)
+              (call $io_mark)
               (i64.extend_i32_u (call $io_read (local.get $port) (local.get $size)))))))
 
   (func $h_call_jmp (param $op i32)

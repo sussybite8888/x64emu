@@ -12,6 +12,7 @@ import { BIOS } from './bios.js';
 import { ATA } from './ata.js';
 import { LocalApic, IoApic } from './apic.js';
 import { Disk, MemoryStore } from './disk.js';
+import { Cirrus, CIRRUS_BAR0_SIZE, CIRRUS_BAR1_SIZE } from './cirrus.js';
 
 // The guest's notion of clock speed.  Everything (TSC, PIT, delay loops) is
 // derived from this one number so the kernel's calibration agrees with the
@@ -19,8 +20,20 @@ import { Disk, MemoryStore } from './disk.js';
 const CPU_HZ = 100_000_000;
 
 // Video memory is carved off the top of RAM so the CPU can write it directly
-// instead of trapping to the host for every pixel.
+// instead of trapping to the host for every pixel.  The first 16 MiB are the
+// framebuffer; the next 16 are the SVGA's BitBLT aperture, which is reserved
+// but routed to the host rather than used as memory.  The whole 32 MiB is the
+// adapter's framebuffer BAR, so it is aligned to its own size.
 const VRAM_BYTES = 16 * 1024 * 1024;
+const FB_BAR_BYTES = 32 * 1024 * 1024;
+
+// What the core may route to the adapter below 1 MiB: the 0xA0000 window and,
+// for the SVGA, its registers at 0xB8000.  The core decides when it does.
+const VGA_ROUTED_END = 0x18100;
+
+// The SVGA's memory-mapped registers, in the window the ACPI root bridge
+// offers for BARs.
+const CIRRUS_MMIO = 0xfebff000;
 
 export class Emulator {
   constructor(opts = {}) {
@@ -34,6 +47,9 @@ export class Emulator {
     // code it cannot compile, so which way it goes depends on the workload.
     this.jitEnabled = opts.jit ?? false;
     this.jit = null;
+    // The display adapter: 'cirrus' adds a Cirrus Logic GD5446 on PCI, which
+    // Windows XP and 2000 have drivers for; 'vga' is a VGA with VBE only.
+    this.display = opts.display ?? 'cirrus';
     this.machine = new Machine({ ramSize: this.ramSize });
     this.io = null;
     this.vga = null;
@@ -62,8 +78,15 @@ export class Emulator {
     // base lands above 0x7fffffff and `& ~0x1fffff` turns it negative -- which
     // is then handed to the guest as its framebuffer address and used here to
     // read the pixels back, so nothing the guest draws is ever seen.
-    const ALIGN = 0x20_0000;
-    this.vramBase = Math.floor((top - VRAM_BYTES) / ALIGN) * ALIGN;
+    // The SVGA's BAR takes 32 MiB, aligned to its size, which a small machine
+    // cannot spare; below 96 MiB it gets a plain VGA and the 16 MiB layout.
+    if (this.display === 'cirrus' && top < 96 * 1024 * 1024) this.display = 'vga';
+    if (this.display === 'cirrus') {
+      this.vramBase = Math.floor((top - FB_BAR_BYTES) / FB_BAR_BYTES) * FB_BAR_BYTES;
+    } else {
+      const ALIGN = 0x20_0000;
+      this.vramBase = Math.floor((top - VRAM_BYTES) / ALIGN) * ALIGN;
+    }
   }
 
   async init(wasmBytes) {
@@ -74,6 +97,9 @@ export class Emulator {
     }
     this.io = new IOBus(this.machine, { debugOut: (b) => this.onSerial(b) });
     this.io.serial.onByte = (b) => this.onSerial(b);
+    // The CMOS memory size, like E801, stops where E820's usable RAM does: the
+    // top of guest RAM is the display's.
+    this.io.cmos.setMemorySize(this.vramBase);
     // Every timer counts against the same virtual clock, read to the
     // instruction: a guest calibrating the APIC timer polls it against the PM
     // timer, and both standing still for a whole slice made that useless.
@@ -99,11 +125,15 @@ export class Emulator {
                     `showing text instead\n`);
     // Planar modes need every CPU write to the window; other modes are faster
     // left as plain memory.
-    this.vga.onWindowRouting = (on) => this.machine.exports.set_vga_mmio(on ? 1 : 0);
+    this.vga.onWindowRouting = (on) => this.machine.exports.set_vga_mmio(Number(on));
+    if (this.display === 'cirrus') this.attachCirrus();
     this.ps2 = new PS2(this.io.pic);
     this.ata = new ATA(this.io.pic);
     this.bios = new BIOS(this);
-    this.bios.acpiOptions = this.acpiOptions;
+    this.bios.acpiOptions = this.acpiOptions && {
+      ...this.acpiOptions,
+      framebuffer: { base: this.vramBase, size: FB_BAR_BYTES },
+    };
     this.bios.log = (msg) => this.emitText(`[bios] ${msg}\n`);
 
     this.io.vga = this.vga;
@@ -126,6 +156,51 @@ export class Emulator {
     m.mmioRead = (addr, size) => this.mmioRead(addr, size);
     m.mmioWrite = (addr, size, val) => this.mmioWrite(addr, size, val);
     return this;
+  }
+
+  /**
+   * The Cirrus GD5446: its registers extend the VGA's, its framebuffer is the
+   * VRAM at the top of RAM, and the BitBLT aperture after it, plus BAR1's
+   * registers, come here through MMIO.
+   */
+  attachCirrus() {
+    const c = new Cirrus(this.vga, this.machine, this.vramBase);
+    this.cirrus = c;
+    this.vga.cirrus = c;
+    c.mmioBase = CIRRUS_MMIO;
+    c.reset();
+    const fn = this.io.pci.addCirrus(this.vramBase, FB_BAR_BYTES, CIRRUS_MMIO, CIRRUS_BAR1_SIZE);
+    this.addMmioDevice({ base: BigInt(this.vramBase), length: FB_BAR_BYTES,
+                         read: (off, size) => c.barRead(off, size),
+                         write: (off, size, val) => c.barWrite(off, size, val) });
+    // The registers answer wherever the guest puts BAR1.  The framebuffer
+    // cannot follow BAR0 -- it is RAM, where it is -- so a guest moving that
+    // is said out loud rather than left drawing into nothing.
+    let warned = false;
+    this.addMmioDevice({
+      get base() {
+        const fb = fn.barAddress(0);
+        // all ones is a guest sizing the BAR, not moving it
+        if (fb !== c.vramBase && fb !== 0 && fb !== ((~(FB_BAR_BYTES - 1)) >>> 0) && !warned) {
+          warned = true;
+          console.warn(`[cirrus] the guest moved the framebuffer BAR to 0x${fb.toString(16)}; ` +
+                       `video memory stays at 0x${c.vramBase.toString(16)}`);
+        }
+        return BigInt(fn.barAddress(1));
+      },
+      length: CIRRUS_BAR1_SIZE,
+      read: (off, size) => c.mmioRead(off, size),
+      write: (off, size, val) => c.mmioWrite(off, size, val),
+    });
+    // The aperture is never memory; the framebuffer stops being memory only
+    // while the CPU is feeding the blitter.
+    const x = this.machine.exports;
+    const hole = () => x.set_trap(BigInt(this.vramBase + VRAM_BYTES), BigInt(this.vramBase + FB_BAR_BYTES));
+    c.onTrapChange = (on) => {
+      if (on) x.set_trap(BigInt(this.vramBase), BigInt(this.vramBase + FB_BAR_BYTES));
+      else hole();
+    };
+    hole();
   }
 
   // ---- interrupts ----------------------------------------------------------
@@ -177,7 +252,7 @@ export class Emulator {
   // Unclaimed physical addresses read as all ones, like an empty bus.
   mmioRead(addr, size) {
     const off = Number(addr) - VGA_WINDOW_BASE;
-    if (off >= 0 && off < VGA_WINDOW_SIZE) {
+    if (off >= 0 && off < VGA_ROUTED_END) {
       let v = 0n;
       for (let i = 0; i < size; i++) {
         v |= BigInt(this.vga.windowRead(off + i)) << BigInt(i * 8);
@@ -191,7 +266,7 @@ export class Emulator {
 
   mmioWrite(addr, size, val) {
     const off = Number(addr) - VGA_WINDOW_BASE;
-    if (off >= 0 && off < VGA_WINDOW_SIZE) {
+    if (off >= 0 && off < VGA_ROUTED_END) {
       for (let i = 0; i < size; i++) {
         this.vga.windowWrite(off + i, Number((val >> BigInt(i * 8)) & 0xffn));
       }
@@ -215,6 +290,8 @@ export class Emulator {
   // ---- boot entry points -------------------------------------------------
   /** Load a kernel directly, skipping the BIOS. */
   bootLinux(opts) {
+    this.bootedLinux = opts;
+    this.bootedImage = null;
     this.bios.disks = [];
     this.ata.reset();
     for (const other of opts.disks ?? []) this.bios.attach(Emulator.toDisk(other, 'disk'));
@@ -249,6 +326,7 @@ export class Emulator {
   bootImage(image, opts = {}) {
     this.bootedImage = image;
     this.bootedOpts = opts;
+    this.bootedLinux = null;
 
     // A reboot has to start the CPU from its power-on state.  Without this the
     // boot sector runs with whatever paging, segment caches and protected-mode
@@ -336,6 +414,28 @@ export class Emulator {
   }
 
   /**
+   * The reset button: the same machine from power-on, with its drives as the
+   * guest left them, as a PC's own reset button does.  An image boots again
+   * through the BIOS; a kernel is loaded again with the same command line.
+   * The triple-fault guard starts afresh, since a user asked for this one.
+   * Returns false when nothing has been booted.
+   */
+  reset() {
+    this.tripleFaults = 0;
+    this.lastTripleAt = undefined;
+    if (this.bootedImage) {
+      this.bootImage(this.bootedImage, this.bootedOpts ?? {});
+      return true;
+    }
+    if (this.bootedLinux) {
+      this.resetHardware();
+      this.bootLinux(this.bootedLinux);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Power-on state for everything except the drives.
    *
    * Every reboot path goes through here so they cannot drift apart: the CPU,
@@ -366,6 +466,7 @@ export class Emulator {
     // A reset masks every interrupt, exactly as the hardware does; POST is what
     // unmasks them again, so it has to run too or the timer is gone for good.
     this.bios?.programPic();
+    this.bios?.programLapic();
     // A device that exists but is missing a method it should have means the
     // page is running a mixture of module versions, which otherwise surfaces
     // as an unexplained "not a function" in the middle of booting.
@@ -374,6 +475,11 @@ export class Emulator {
                       'clear the cached module');
     }
     this.vga?.reset();
+  }
+
+  /** Compilation and coverage counters, or null with the JIT off. */
+  jitStats() {
+    return this.jit ? this.jit.stats() : null;
   }
 
   /** Attach a blank writable RAM drive without rebooting. */
@@ -449,7 +555,10 @@ export class Emulator {
 
     // Either a HLT or a BIOS call blocking on the keyboard means the guest has
     // nothing to do until the next interrupt; jump the clock rather than spin.
-    if (reason === EXIT_HALT || this.idleWait) {
+    // A host that runs in real time (the browser) holds the clock back to the
+    // wall clock when this happens, which is what lastStepIdle tells it.
+    this.lastStepIdle = reason === EXIT_HALT || this.idleWait;
+    if (this.lastStepIdle) {
       // asleep until the next timer tick, or the APIC timer or RTC if sooner
       let tickNs = 1e9 / this.io.pit.hz;
       const at = this.virtualNs + elapsedNs;

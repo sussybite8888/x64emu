@@ -10,6 +10,13 @@ export const RAM_BASE = 0;
 // Wasm pages are 64 KiB.
 const PAGE = 65536;
 
+// The state block plus the JIT's tables (see part 85 of the core).
+const STATE_PAGES = 72;
+
+// Physical pages holding compiled code, one bit each, inside the state block.
+// The host checks it before telling the core about a write of its own.
+const JIT_CODE_MAP = 0x30000;
+
 // segment register indices, matching the WAT core
 export const ES = 0, CS = 1, SS = 2, DS = 3, FS = 4, GS = 5;
 
@@ -23,8 +30,9 @@ export class Machine {
   constructor(opts = {}) {
     this.ramSize = opts.ramSize ?? 128 * 1024 * 1024;
 
-    // Memory 0 holds CPU state and the TLB and never changes size.
-    this.stateMem = new WebAssembly.Memory({ initial: 1 });
+    // Memory 0 holds CPU state, the TLBs and the JIT's tables, and never
+    // changes size.  The core declares the minimum it needs.
+    this.stateMem = new WebAssembly.Memory({ initial: STATE_PAGES });
     this.stateU8 = new Uint8Array(this.stateMem.buffer);
     this.stateU32 = new Uint32Array(this.stateMem.buffer);
     // The general registers are plain memory at the base of the state block, so
@@ -91,6 +99,8 @@ export class Machine {
         mmio_read: (addr, size) => this.mmioRead(addr, size),
         mmio_write: (addr, size, val) => this.mmioWrite(addr, size, val),
         irq_ack: () => this.irqAck(),
+        // With no JIT attached there is nothing to be exact about.
+        jit_precise: (pa, len) => (this.jitPrecise ? this.jitPrecise(Number(pa), len) : 1),
         host_log: (tag, a, b) => console.log(`[cpu ${tag}] ${a.toString(16)} ${b.toString(16)}`),
         // WebAssembly has no transcendental instructions, so the x87 unit
         // borrows the host's.
@@ -114,13 +124,31 @@ export class Machine {
   rd16(pa) { return this.dv.getUint16(pa, true); }
   rd32(pa) { return this.dv.getUint32(pa, true); }
   rd64(pa) { return this.dv.getBigUint64(pa, true); }
-  wr8(pa, v)  { this.u8[pa] = v; }
-  wr16(pa, v) { this.dv.setUint16(pa, v, true); }
-  wr32(pa, v) { this.dv.setUint32(pa, v, true); }
-  wr64(pa, v) { this.dv.setBigUint64(pa, BigInt(v), true); }
+  wr8(pa, v)  { this.hostWrote(pa, 1); this.u8[pa] = v; }
+  wr16(pa, v) { this.hostWrote(pa, 2); this.dv.setUint16(pa, v, true); }
+  wr32(pa, v) { this.hostWrote(pa, 4); this.dv.setUint32(pa, v, true); }
+  wr64(pa, v) { this.hostWrote(pa, 8); this.dv.setBigUint64(pa, BigInt(v), true); }
+
+  /**
+   * A write by the host -- a BIOS disk read, a mode set clearing video memory
+   * -- that lands on compiled code has to invalidate it, exactly as a guest
+   * store would.  The bitmap is read here so that the common case, a page
+   * with no code on it, never crosses into the core.
+   */
+  hostWrote(pa, len) {
+    const first = Math.floor(pa / 4096), last = Math.floor((pa + len - 1) / 4096);
+    for (let p = first; p <= last; p++) {
+      const i = p & 0xfffff;
+      if (this.stateU8[JIT_CODE_MAP + (i >> 3)] & (1 << (i & 7))) {
+        this.exports.jit_host_write(BigInt(pa), len);
+        return;
+      }
+    }
+  }
 
   /** Copy into guest RAM, in chunks so arbitrarily large images are fine. */
   writeBytes(pa, bytes) {
+    this.hostWrote(pa, bytes.length);
     if (bytes.length <= 0x400000) { this.u8.set(bytes, pa); return; }
     const step = 0x400000;
     for (let off = 0; off < bytes.length; off += step) {

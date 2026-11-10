@@ -64,6 +64,14 @@
 ;;    0x6300  prefix map: non-zero for every byte that is a prefix
 ;;    0x7000  execution ring (index, then 1024 x 16 bytes at 0x7008)
 ;;              +0 rip   +8 the register named by $trace_reg
+;;    0x1C0   per-segment fast limit (6 x i64): the highest offset an access
+;;              may end at and still take compiled code's inline path, or -1
+;;              when every access must go the slow way (expand-down segments).
+;;              Kept by $seg_store.
+;;
+;;    The state memory is 4.5 MiB; everything from 0x10000 belongs to the JIT
+;;    and is laid out in part 85.
+;;
 ;;    0xF800  x87 form histogram: one byte per (escape opcode, ModRM) pair,
 ;;              set when that encoding executes.  Unimplemented x87 forms fall
 ;;              through and do nothing rather than faulting, so this is what
@@ -76,7 +84,7 @@
   ;; ---- imports ---------------------------------------------------------
   ;;  Memory 0 is the state block; instructions without an explicit memory
   ;;  operand address it, so every state access below stays a plain i32 load.
-  (import "env" "state" (memory $state 1))
+  (import "env" "state" (memory $state 72))
   (import "env" "ram" (memory $ram i64 1))
 
   ;;  Compiled blocks are published here by the host and reached with one
@@ -93,6 +101,11 @@
   ;; memory mapped I/O for physical addresses outside RAM
   (import "env" "mmio_read"  (func $mmio_read  (param i64 i32) (result i64)))
   (import "env" "mmio_write" (func $mmio_write (param i64 i32 i64)))
+
+  ;; A store reached a 16-byte region holding compiled code: does it touch the
+  ;; instructions themselves?  The host keeps the byte-exact map; asking it only
+  ;; happens on this rare path.  Returns 1 if it does.
+  (import "env" "jit_precise" (func $jit_precise (param i64 i32) (result i32)))
 
   ;; interrupt controller: returns vector 0..255, or -1 if nothing pending
   (import "env" "irq_ack"    (func $irq_ack (result i32)))
@@ -126,6 +139,14 @@
   ;; being plain RAM, so the VGA's planar write logic can run.  Text mode at
   ;; 0xB8000 is deliberately left as ordinary memory.
   (global $vga_mmio (mut i32) (i32.const 0))
+  ;; Where the routed window ends: 0xB0000 normally, 0xB8100 while the SVGA
+  ;; also has its BitBLT registers at 0xB8000 (Cirrus SR17).
+  (global $vga_win_hi (mut i64) (i64.const 0xB0000))
+  ;; A range of physical addresses inside RAM that is nevertheless handed to
+  ;; the host: the SVGA's BitBLT aperture, and the whole framebuffer while the
+  ;; CPU is feeding the blitter.  Empty when $trap_hi is zero.
+  (global $trap_lo (mut i64) (i64.const 0))
+  (global $trap_hi (mut i64) (i64.const 0))
   ;; ANDed into every physical address.  All ones with A20 on; with the gate
   ;; off bit 20 is clear, so FFFF:0010 wraps to zero as on an 8086.  HIMEM
   ;; checks for that wrap and retries until it sees it.
@@ -195,13 +216,20 @@
   (global $fetch_page (mut i64) (i64.const -1))
   (global $fetch_phys (mut i64) (i64.const 0))
 
-  ;; The same idea for data: one page each for loads and stores, which is
-  ;; enough because a loop usually works on one buffer and one stack frame.
-  ;; Reads and writes get separate slots so they do not evict each other.
-  (global $dr_page (mut i64) (i64.const -1))
-  (global $dr_phys (mut i64) (i64.const 0))
-  (global $dw_page (mut i64) (i64.const -1))
-  (global $dw_phys (mut i64) (i64.const 0))
+  ;; Data accesses go through the translation cache in part 85 (the "JIT
+  ;; TLB"), which the interpreter and compiled code share.  An entry's tag
+  ;; carries the page and whether it was filled for user or supervisor access;
+  ;; this is the bit pattern the current privilege looks for: bit 0 valid, bit
+  ;; 1 user.  It changes with CPL, so a privilege change needs no flush.
+  (global $jtlb_bits (mut i32) (i32.const 1))
+
+  ;; Set by anything that leaves a running compiled block's assumptions wrong:
+  ;; a write to a page holding compiled code, a mode or CS/SS change, a TLB
+  ;; flush.  A block checks it after every call it makes out to the core.
+  (global $jit_exit (mut i32) (i32.const 0))
+  ;; Instructions a block may retire before it must return; compiled loops
+  ;; consult it so a long loop cannot hold off the timer.
+  (global $jit_budget (mut i32) (i32.const 0))
 
   ;; Guest RAM now starts at offset 0 of its own memory; kept as a function so
   ;; the host does not have to special-case anything.

@@ -2,10 +2,8 @@
 //  Browser front end: VGA canvas, serial log, keyboard routing, run loop.
 // ---------------------------------------------------------------------------
 
-import { Emulator } from './emulator.js';
 import { human, formatDiskRow } from './format.js';
-import { Display } from './display.js';
-import { Disk, fileStore } from './disk.js';
+import { Display, FrameSource } from './display.js';
 
 // Sizes may be written as 512M, 8G, 2T; there is no imposed ceiling.
 function parseSize(text, fallback) {
@@ -56,7 +54,10 @@ class SerialLog {
 class App {
   constructor() {
     this.serial = new SerialLog($('serial'));
-    this.emu = null;
+    // The machine runs in a worker; the page holds only what it last sent.
+    this.worker = null;
+    this.booted = false;
+    this.screen = new FrameSource();
     this.display = null;
     this.running = false;
     this.image = null;
@@ -82,6 +83,8 @@ class App {
       const probe = await WebAssembly.compile(this.wasm);
       this.fpuPresent = WebAssembly.Module.imports(probe).some((i) => i.name === 'f_sin');
     } catch { this.fpuPresent = false; }
+    this.display = new Display($('vga'), this.screen);
+    this.startWorker();
     this.serial.lines = [''];
     this.log(`x64emu ready (core ${this.wasm.byteLength} bytes, ` +
              `FPU ${this.fpuPresent ? 'yes' : 'NO'}).`);
@@ -90,28 +93,89 @@ class App {
     this.wire();
   }
 
-  async makeEmulator() {
-    const ramSize = parseSize($('ram').value, 256 * 1024 * 1024);
-    try {
-      this.emu = new Emulator({ ramSize, sliceSize: 400_000 });
-    } catch (err) {
-      this.log(err.message);
-      throw err;
+  // ---- the worker ----------------------------------------------------------
+  startWorker() {
+    this.worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+    this.worker.onmessage = (e) => this.onWorker(e.data);
+    this.worker.onerror = (e) => this.log(`[worker failed: ${e.message ?? 'unknown error'}]`);
+    // A copy, so the page keeps its own for the capability probe.
+    this.worker.postMessage({ type: 'init', wasm: this.wasm.slice(0) });
+  }
+
+  send(msg, transfer) { this.worker?.postMessage(msg, transfer ?? []); }
+
+  onWorker(msg) {
+    switch (msg.type) {
+      case 'ready':
+        return;
+      case 'log':
+        this.log(msg.text);
+        return;
+      case 'serial':
+        for (let i = 0; i < msg.text.length; i++) this.serial.write(msg.text.charCodeAt(i));
+        return;
+      case 'booted':
+        this.booted = true;
+        this.ramSize = msg.ramSize;
+        if (msg.kind === 'image') {
+          const info = msg.info;
+          this.log(`booting ${info.name} as ${info.kind}: ${info.sectors} sectors ` +
+                   `of ${info.sectorSize} bytes, drive 0x${info.drive.toString(16)}`);
+          this.reportDisks(info, msg.ramDisk);
+        } else {
+          const info = msg.info;
+          this.log(`boot protocol ${info.version >> 8}.${info.version & 0xff}, ` +
+                   `${info.bits}-bit entry at 0x${info.entry.toString(16)}`);
+          this.reportDisks({ disks: [] }, msg.ramDisk);
+        }
+        this.lastStatsAt = 0;
+        this.updateButtons();
+        return;
+      case 'video':
+        $('video').textContent = msg.desc;
+        // The canvas backing store changes size with the mode, so its CSS size
+        // has to be recomputed or the picture keeps the previous dimensions.
+        requestAnimationFrame(() => this.applyZoom());
+        return;
+      case 'frame': {
+        const before = this.screen.describe();
+        this.screen.update(msg);
+        this.display.render(performance.now());
+        if (this.screen.describe() !== before) this.applyZoom();
+        // Drawn: the worker may send the next one.
+        this.send({ type: 'frame-ack' });
+        return;
+      }
+      case 'stats':
+        this.updateStats(msg);
+        return;
+      case 'reset':
+        this.log('\n[reset]');
+        this.running = true;
+        this.updateButtons();
+        return;
+      case 'exit':
+        this.running = false;
+        this.log(`\n[machine stopped: ${msg.why}]`);
+        this.updateButtons();
+        return;
+      case 'download': {
+        const blob = new Blob([msg.data], { type: 'application/octet-stream' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = msg.name;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        return;
+      }
+      case 'error':
+        this.running = false;
+        this.log(`[emulator error] ${msg.message}`);
+        this.updateButtons();
+        return;
+      default:
+        return;
     }
-    await this.emu.init(this.wasm);
-    this.emu.onSerial = (b) => this.serial.write(b);
-    this.emu.onDisplay = (desc) => {
-      $('video').textContent = desc;
-      // The canvas backing store changes size with the mode, so its CSS size
-      // has to be recomputed or the picture keeps the previous dimensions.
-      requestAnimationFrame(() => this.applyZoom());
-    };
-    this.emu.onExit = (why) => {
-      this.running = false;
-      this.log(`\n[machine stopped: ${why}]`);
-      this.updateButtons();
-    };
-    this.display = new Display($('vga'), this.emu.vga);
   }
 
   wire() {
@@ -140,8 +204,10 @@ class App {
     $('bootImage').addEventListener('click', () => this.bootImage());
     $('bootKernel').addEventListener('click', () => this.bootKernel());
     $('pause').addEventListener('click', () => this.togglePause());
+    $('reset').addEventListener('click', () => this.reset());
     $('stop').addEventListener('click', () => {
       this.running = false;
+      this.send({ type: 'run', running: false });
       this.log('[stopped by user]');
       this.updateButtons();
     });
@@ -166,29 +232,33 @@ class App {
     canvas.addEventListener('mousedown', (e) => {
       canvas.focus();
       if (!captured()) {
-        if (this.emu && this.running) canvas.requestPointerLock();
+        if (this.booted && this.running) canvas.requestPointerLock();
         return;
       }
       this.buttons = (this.buttons ?? 0) | bit(e);
-      this.emu?.sendMouse(0, 0, this.buttons);
+      this.sendMouse(0, 0, this.buttons);
     });
     canvas.addEventListener('mouseup', (e) => {
       if (!captured()) return;
       this.buttons = (this.buttons ?? 0) & ~bit(e);
-      this.emu?.sendMouse(0, 0, this.buttons);
+      this.sendMouse(0, 0, this.buttons);
     });
     canvas.addEventListener('mousemove', (e) => {
-      if (!this.emu || !this.running || !captured()) return;
-      this.emu.sendMouse(e.movementX ?? 0, e.movementY ?? 0, this.buttons ?? 0);
+      if (!this.booted || !this.running || !captured()) return;
+      this.sendMouse(e.movementX ?? 0, e.movementY ?? 0, this.buttons ?? 0);
     });
     document.addEventListener('pointerlockchange', () => {
       if (captured() || !this.buttons) return;
       this.buttons = 0;                        // nothing stays held once released
-      this.emu?.sendMouse(0, 0, 0);
+      this.sendMouse(0, 0, 0);
     });
     document.addEventListener('pointerlockerror', () => { this.noPointerLock = true; });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     window.addEventListener('blur', () => this.releaseAll());
+  }
+
+  sendMouse(dx, dy, buttons) {
+    this.send({ type: 'mouse', dx, dy, buttons });
   }
 
   applyZoom() {
@@ -207,7 +277,7 @@ class App {
   }
 
   onKey(e, pressed) {
-    if (!this.emu || !this.running) return;
+    if (!this.booted || !this.running) return;
     e.preventDefault();
 
     if (this.keyboardToSerial) {
@@ -221,99 +291,73 @@ class App {
         s = e.ctrlKey ? String.fromCharCode(e.key.toUpperCase().charCodeAt(0) & 0x1f)
                       : e.key;
       }
-      if (s !== null) this.emu.sendInput(s);
+      if (s !== null) this.send({ type: 'serial-in', text: s });
       return;
     }
-    this.emu.sendKey(e.code, pressed);
+    this.send({ type: 'key', code: e.code, pressed });
     if (pressed) this.heldKeys = (this.heldKeys ?? new Set()).add(e.code);
     else this.heldKeys?.delete(e.code);
   }
 
   // Releasing everything on focus loss avoids a key sticking down in the guest.
   releaseAll() {
-    if (!this.emu || !this.heldKeys) return;
-    for (const code of this.heldKeys) this.emu.sendKey(code, false);
+    if (!this.booted || !this.heldKeys) return;
+    for (const code of this.heldKeys) this.send({ type: 'key', code, pressed: false });
     this.heldKeys.clear();
   }
 
   async bootImage() {
     if (!this.image) return;
-    await this.makeEmulator();
     this.serial.lines = [''];
-    try {
-      const store = fileStore(this.image);
-      // The volume descriptors have to be resident before the image kind can be
-      // sniffed.  Anything further in (a boot catalog, the boot image) is
-      // fetched on demand through the BIOS retry path.
-      await store.ensure(0, 64 * 1024);
-      if (store.size > 20 * 2048) await store.ensure(16 * 2048, 4 * 2048);
-      const disk = new Disk(store, $('imageKind').value, this.image.name);
-      const info = this.emu.bootImage(disk, {
-        hddSize: parseSize($('hddSize').value, 0),
-        hddName: 'ram0',
-      });
-      this.log(`booting ${info.name} as ${info.kind}: ${info.sectors} sectors ` +
-               `of ${info.sectorSize} bytes, drive 0x${info.drive.toString(16)}`);
-      this.reportDisks(info);
-    } catch (err) {
-      this.log(`boot failed: ${err.message}`);
-      return;
-    }
+    this.serial.flush();
+    this.running = true;
+    // The File itself goes to the worker, which reads it in pieces.
+    this.send({
+      type: 'boot-image',
+      file: this.image,
+      kind: $('imageKind').value,
+      hddSize: parseSize($('hddSize').value, 0),
+      ramSize: parseSize($('ram').value, 256 * 1024 * 1024),
+      ...this.machineOptions(),
+    });
     this.start();
   }
 
-  reportDisks(info) {
+  /** What the machine is built with, besides its disks. */
+  machineOptions() {
+    return { display: $('display').value, jit: $('jit').checked };
+  }
+
+  reportDisks(info, ramDisk) {
     for (const d of info.disks ?? []) {
       this.log(`  drive 0x${d.drive.toString(16)}: ${d.name} (${d.kind}, ` +
                `${d.sectors.toLocaleString()} sectors, ` +
                `${d.writable ? 'writable' : 'read-only'})`);
     }
-    $('downloadHdd').disabled = !this.emu.ramDisk;
-    $('hddState').textContent = this.emu.ramDisk
-      ? `${human(this.emu.ramDisk.store.size)} attached`
-      : 'not attached';
+    $('downloadHdd').disabled = !ramDisk;
+    $('hddState').textContent = ramDisk ? `${human(ramDisk.size)} attached` : 'not attached';
   }
 
   // Hand back whatever the guest actually wrote, so work on the RAM drive can
   // be kept.  Only the committed chunks are materialised.
   downloadDisk() {
-    const disk = this.emu?.ramDisk;
-    if (!disk) return;
-    const committed = disk.allocated;
-    if (committed > 512 * 1024 * 1024) {
-      this.log(`disk holds ${human(committed)}; that is too large to export here`);
-      return;
-    }
-    const blob = new Blob([disk.store.export()], { type: 'application/octet-stream' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `${disk.name}.img`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    if (this.booted) this.send({ type: 'download' });
   }
 
   async bootKernel() {
     if (!this.kernel) return;
-    await this.makeEmulator();
     this.serial.lines = [''];
-    try {
-      const info = this.emu.bootLinux({
-        kernel: this.kernel.data,
-        initrd: this.initrd?.data ?? null,
-        cmdline: $('cmdline').value,
-        hddSize: parseSize($('hddSize').value, 0),
-        hddName: 'ram0',
-      });
-      this.log(`boot protocol ${info.setup.version >> 8}.${info.setup.version & 0xff}, ` +
-               `${info.bits}-bit entry at 0x${info.entry.toString(16)}`);
-      $('downloadHdd').disabled = !this.emu.ramDisk;
-      $('hddState').textContent = this.emu.ramDisk
-        ? `${human(this.emu.ramDisk.store.size)} attached on ATA`
-        : 'not attached';
-    } catch (err) {
-      this.log(`boot failed: ${err.message}`);
-      return;
-    }
+    this.serial.flush();
+    this.running = true;
+    this.send({
+      type: 'boot-kernel',
+      kernel: this.kernel.data,
+      initrd: this.initrd?.data ?? null,
+      cmdline: $('cmdline').value,
+      hddSize: parseSize($('hddSize').value, 0),
+      ramSize: parseSize($('ram').value, 256 * 1024 * 1024),
+      ...this.machineOptions(),
+    });
     this.start();
   }
 
@@ -322,45 +366,47 @@ class App {
     this.updateButtons();
     $('vga').focus();
     this.applyZoom();
-    this.loop();
+    this.blink();
+  }
+
+  /**
+   * The machine's reset button: it restarts from power-on, paused, stopped or
+   * running, and keeps whatever the guest wrote to its disks.  Keys held down
+   * are forgotten rather than released, since the keyboard is reset as well.
+   */
+  reset() {
+    if (!this.booted) return;
+    this.heldKeys?.clear();
+    this.send({ type: 'reset' });
+    $('vga').focus();
   }
 
   togglePause() {
-    if (!this.emu) return;
+    if (!this.booted) return;
     this.running = !this.running;
+    this.send({ type: 'run', running: this.running });
     this.updateButtons();
-    if (this.running) this.loop();
   }
 
   updateButtons() {
     $('bootImage').disabled = !this.image;
     $('bootKernel').disabled = !this.kernel;
-    $('pause').disabled = !this.emu;
+    $('pause').disabled = !this.booted;
+    $('reset').disabled = !this.booted;
     $('pause').textContent = this.running ? 'Pause' : 'Resume';
   }
 
-  async loop() {
-    if (this.looping) return;
-    this.looping = true;
-    while (this.running) {
-      // Bound the work per frame so the page stays responsive.
-      const deadline = performance.now() + 12;
-      while (performance.now() < deadline) {
-        if (!this.emu.step()) { this.running = false; break; }
-        // If the guest is blocked on a disk read, wait for it here rather than
-        // letting it spin for the rest of the frame.  Reading an image in
-        // pieces is otherwise limited to one chunk per frame.
-        const io = this.emu.pendingIo();
-        if (io) { await io; }
-      }
-      const now = performance.now();
-      this.display.render(now);
+  // Frames arrive from the worker and are drawn as they come; all that is left
+  // to do here is keep the text cursor blinking and the serial log current.
+  blink() {
+    if (this.blinking) return;
+    this.blinking = true;
+    const tick = () => {
+      if (this.screen.mode.text) this.display.render(performance.now());
       this.serial.flush();
-      this.updateStats(now);
-      await new Promise((r) => requestAnimationFrame(r));
-    }
-    this.looping = false;
-    this.updateButtons();
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   }
 
   /**
@@ -397,39 +443,50 @@ class App {
     });
   }
 
-  updateStats(now) {
-    if (now - this.lastStatsAt < 250) return;
-    const s = this.emu.stats;
+  updateStats(s) {
+    const now = performance.now();
     const dt = (now - this.lastStatsAt) / 1000;
-    const mips = this.lastStatsAt ? (s.instructions - this.lastInstrs) / dt / 1e6 : 0;
+    const mips = this.lastStatsAt && s.instructions >= this.lastInstrs
+      ? (s.instructions - this.lastInstrs) / dt / 1e6 : 0;
     this.lastStatsAt = now;
     this.lastInstrs = s.instructions;
 
     $('mips').textContent = mips.toFixed(1);
+    // Of the instructions run since the last update, the share that ran as
+    // compiled code: what decides how much faster the JIT makes a guest.
+    if (s.jit) {
+      const ran = s.instructions - (this.lastJitTotal ?? 0);
+      const inBlocks = s.jit.instrsRun - (this.lastJitRun ?? 0);
+      this.lastJitTotal = s.instructions;
+      this.lastJitRun = s.jit.instrsRun;
+      const share = ran > 0 ? Math.min(100, Math.max(0, (100 * inBlocks) / ran)) : 0;
+      $('jitStat').textContent = `${share.toFixed(0)}% compiled, ${s.jit.compiled.toLocaleString()} blocks`;
+    } else {
+      $('jitStat').textContent = 'off';
+    }
     $('instrs').textContent = s.instructions.toLocaleString();
     $('mode').textContent = s.vm ? 'virtual 8086' : (MODE_NAMES[s.mode] ?? s.mode);
     $('cpl').textContent = s.cpl;
     $('video').textContent = s.video;
-    $('ramStat').textContent = human(this.emu.ramSize);
+    $('ramStat').textContent = human(s.ramSize);
     $('litStat').textContent = this.display?.litSample == null
       ? 'text mode'
       : `${this.display.litSample} / ${this.display.litTotal}`;
-    $('diskStat').textContent = this.emu.ramDisk
-      ? `${human(this.emu.ramDisk.allocated)} / ${human(this.emu.ramDisk.store.size)}`
+    $('diskStat').textContent = s.ramDisk
+      ? `${human(s.ramDisk.allocated)} / ${human(s.ramDisk.size)}`
       : '-';
     this.updateDiskIo(s.disks ?? [], dt);
-    $('state').textContent = s.halted ? 'halted' : (this.running ? 'running' : 'paused');
+    $('state').textContent = s.halted ? 'halted' : (s.running ? 'running' : 'paused');
 
-    const m = this.emu.machine;
-    const hex = (v, w = 16) => v.toString(16).padStart(w, '0');
+    const hex = (v, w = 16) => BigInt.asUintN(64, BigInt(v)).toString(16).padStart(w, '0');
     let rows = '';
     for (let i = 0; i < 16; i += 2) {
-      rows += `${REG_NAMES[i].padEnd(3)} ${hex(m.getReg(i))}   ` +
-              `${REG_NAMES[i + 1].padEnd(3)} ${hex(m.getReg(i + 1))}\n`;
+      rows += `${REG_NAMES[i].padEnd(3)} ${hex(s.regs[i])}   ` +
+              `${REG_NAMES[i + 1].padEnd(3)} ${hex(s.regs[i + 1])}\n`;
     }
-    rows += `rip ${hex(m.rip)}   fl  ${hex(m.flags)}\n`;
-    rows += `cr0 ${hex(m.getCR(0))}   cr3 ${hex(m.getCR(3))}\n`;
-    rows += `cr4 ${hex(m.getCR(4))}   efr ${hex(m.getCR(9))}\n`;
+    rows += `rip ${hex(s.rip)}   fl  ${hex(s.flags)}\n`;
+    rows += `cr0 ${hex(s.cr0)}   cr3 ${hex(s.cr3)}\n`;
+    rows += `cr4 ${hex(s.cr4)}   efr ${hex(s.efer)}\n`;
     $('regs').textContent = rows;
   }
 }

@@ -8,6 +8,13 @@
 // registers and the whole scratch page -- has exactly one right answer.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { newMachine, setupLongMode } from '../../tests/harness.mjs';
+import { Jit } from '../../src/js/jit.js';
+
+// --jit compiles each case as a one-instruction block and runs it through the
+// compiled code instead of the interpreter, holding the JIT to the same
+// hardware results.  Instructions it hands back to the interpreter are still
+// covered, through the path a block uses to do that.
+const useJit = process.argv.includes('--jit');
 
 const dir = new URL('.', import.meta.url).pathname;
 const code = readFileSync(dir + 'cases.bin');
@@ -36,6 +43,9 @@ const NAMES = ['rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',
 const m = await newMachine({ ramSize: 64 * 1024 * 1024 });
 m.writeBytes(BASE, code);
 setupLongMode(m, { entry: BASE, stack: STACK });
+const jit = useJit ? new Jit(m, { maxInstrs: 1 }) : null;
+if (jit) m.exports.jit_enable(1);
+let compiled = 0;
 const xmmView = new Uint8Array(m.stateMem.buffer, XMM_OFF, 256);
 const st32 = new Uint32Array(m.stateMem.buffer);
 const stF64 = new Float64Array(m.stateMem.buffer);
@@ -94,6 +104,8 @@ for (let i = 0; i < N; i++) {
   m.writeBytes(SCRATCH, pattern);
   const start = BigInt(BASE + i * SLOT);
   m.exports.set_rip(start);
+  // Identity mapped, so the slot's linear address is its physical one.
+  if (jit && jit.compileNow(BASE + i * SLOT)) compiled++;
   // A repeated string operation retires one element per step and re-enters at
   // the same address, so "one instruction" here means "step until RIP leaves
   // this slot".  The bound stops a runaway from hanging the run; the generator
@@ -182,7 +194,9 @@ if (unimpl.size) {
     [...unimpl].sort((a, b) => b[1] - a[1]).map(([o, n]) => `${o} x${n}`).join(', '));
 }
 console.log(`\n${ran} cases run, ${skipped} skipped, ${fails.length} mismatches ` +
-            `across ${byOp.size} instructions\n`);
+            `across ${byOp.size} instructions` +
+            (jit ? ` (JIT: ${compiled} compiled, ${jit.interpInstrs} of them handed to the interpreter)` : '') +
+            '\n');
 for (const [op, list] of [...byOp].sort((a, b) => b[1].length - a[1].length)) {
   console.log(`  ${op.padEnd(12)} ${String(list.length).padStart(5)} failing`);
   for (const f of list.slice(0, 3)) {
@@ -190,6 +204,6 @@ for (const [op, list] of [...byOp].sort((a, b) => b[1].length - a[1].length)) {
     for (const b of f.bad.slice(0, 4)) console.log(`          ${b}`);
   }
 }
-writeFileSync(dir + 'failures.json', JSON.stringify(fails.slice(0, 500), null, 1));
+writeFileSync(dir + (useJit ? 'failures-jit.json' : 'failures.json'), JSON.stringify(fails.slice(0, 500), null, 1));
 if (fails.length) console.log(`\nfull detail in tools/difftest/failures.json`);
 process.exit(fails.length ? 1 : 0);

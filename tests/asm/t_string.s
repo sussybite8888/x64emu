@@ -158,6 +158,60 @@ _start:
         je      fail
         want    %rcx, 12, 29                    // stopped after the fourth byte
 
+// ---- an overlapping forward copy repeats a pattern ---------------------
+// x86 copies one element at a time, front to back, so a destination one byte
+// above its source re-reads what it has just written.  A bulk copy with
+// memmove semantics would shift the bytes instead.
+        lea     pat(%rip), %rsi
+        lea     pat+1(%rip), %rdi
+        mov     $15, %rcx
+        rep     movsb
+        mov     pat(%rip), %rax
+        want    %rax, 0x5A5A5A5A5A5A5A5A, 30
+        mov     pat+8(%rip), %rax
+        want    %rax, 0x5A5A5A5A5A5A5A5A, 31
+
+// ---- a copy across several pages ---------------------------------------
+// Fill 12000 bytes with a pattern, copy them as dwords to a destination that
+// sits at a different offset within its pages, and compare.  Large copies are
+// done a page at a time, so this crosses every boundary case.
+        mov     $0x400001, %rdi
+        xor     %ecx, %ecx
+1:      mov     %ecx, %eax
+        shr     $8, %eax
+        xor     %ecx, %eax
+        mov     %al, (%rdi,%rcx)
+        inc     %ecx
+        cmp     $12000, %ecx
+        jne     1b
+        mov     $0x400001, %rsi
+        mov     $0x410ffd, %rdi
+        mov     $3000, %rcx
+        rep     movsl
+        want    %rcx, 0, 32
+        mov     $0x410ffd + 12000, %rax
+        cmp     %rax, %rdi
+        mov     $33, %r13b
+        jne     fail
+        mov     $0x400001, %rsi
+        mov     $0x410ffd, %rdi
+        mov     $12000, %rcx
+        repe    cmpsb
+        mov     $34, %r13b
+        jne     fail
+        want    %rcx, 0, 35
+// and REP STOSW over the same span
+        mov     $0x410ffd, %rdi
+        mov     $0xBEEF, %ax
+        mov     $6000, %rcx
+        rep     stosw
+        movzwl  0x410ffd, %eax
+        want    %rax, 0xBEEF, 36
+        movzwl  0x410ffd + 11998, %eax
+        want    %rax, 0xBEEF, 37
+        movzbl  0x410ffd + 12000, %eax
+        want    %rax, 0, 38                     // and not one byte past
+
         xor     %eax, %eax
         out     %al, $0xE9
         hlt
@@ -176,3 +230,5 @@ dst:    .quad   0, 0
 dst2:   .quad   0, 0
 dst3:   .quad   0, 0
 dst4:   .quad   0, 0
+pat:    .byte   0x5A
+        .fill   15, 1, 0

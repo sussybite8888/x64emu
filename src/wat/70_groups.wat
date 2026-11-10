@@ -384,6 +384,11 @@
       (then
         (call $setregN (i32.const 1) (global.get $addrsize)
               (i64.sub (call $regN (i32.const 1) (global.get $addrsize)) (i64.const 1)))
+        ;; MOVS and STOS go on to do as many more as fit in their pages at once
+        (if (i32.or (i32.lt_u (local.get $op) (i32.const 0xA6))
+                    (i32.and (i32.ge_u (local.get $op) (i32.const 0xAA))
+                             (i32.lt_u (local.get $op) (i32.const 0xAC))))
+          (then (call $string_bulk (local.get $op) (local.get $size) (local.get $seg))))
         (local.set $done (i64.eqz (call $trunc (call $regN (i32.const 1) (global.get $addrsize))
                                                (global.get $addrsize))))
         ;; REPE/REPNE also terminate on the zero flag for CMPS and SCAS
@@ -394,8 +399,134 @@
             (if (i32.eq (global.get $rep) (i32.const 3))
               (then (if (i32.eqz (call $zf)) (then (local.set $done (i32.const 1)))))
               (else (if (call $zf) (then (local.set $done (i32.const 1))))))))
+        ;; Re-execute.  RIP is rewound directly rather than through $set_rip:
+        ;; this is not a branch, and treating every iteration as one would send
+        ;; each through the block cache.
         (if (i32.eqz (local.get $done))
-          (then (call $set_rip (global.get $rip0)))))))    ;; re-execute
+          (then (global.set $rip_g (global.get $rip0)))))))
+
+  ;; ---- REP MOVS / REP STOS in bulk ----------------------------------------
+  ;;  One iteration at a time, through the whole run loop, is how a repeated
+  ;;  string instruction keeps interrupts timely -- and at Windows 95's desktop
+  ;;  a third of everything the interpreter executed was VMM copying memory a
+  ;;  dword per trip.  After an ordinary iteration has checked the segments,
+  ;;  faulted if it was going to and left translations in the JIT TLB, this
+  ;;  does as many more as fit in the current source and destination pages:
+  ;;  at most a page per step, so interrupts are still taken promptly.
+  ;;
+  ;;  It stays out of the way of anything unusual: decrementing (DF set),
+  ;;  segments whose limits are not a plain upper bound, a destination page
+  ;;  without a cached write translation (MMIO, compiled code, a watched or
+  ;;  read-only page), or an offset that would wrap.
+  (func $string_bulk (param $op i32) (param $size i32) (param $seg i32)
+    (local $as i32) (local $amask i64) (local $n i64) (local $di i64) (local $si i64)
+    (local $ld i64) (local $ls i64) (local $k i64) (local $room i64) (local $bytes i64)
+    (local $pd i64) (local $ps i64) (local $slot i32) (local $v i64) (local $i i64)
+    (local $movs i32) (local $sz i64)
+    (if (call $df) (then (return)))
+    (if (global.get $watch_len) (then (return)))
+    (local.set $movs (i32.lt_u (local.get $op) (i32.const 0xA6)))
+    (local.set $sz (i64.extend_i32_u (local.get $size)))
+    (local.set $as (global.get $addrsize))
+    (local.set $amask (call $trunc (i64.const -1) (local.get $as)))
+    (local.set $n (i64.and (call $regN (i32.const 1) (local.get $as)) (local.get $amask)))
+    (if (i64.eqz (local.get $n)) (then (return)))
+    (local.set $di (i64.and (call $regN (i32.const 7) (local.get $as)) (local.get $amask)))
+    (local.set $si (i64.and (call $regN (i32.const 6) (local.get $as)) (local.get $amask)))
+
+    ;; linear addresses, as $seg_lin forms them
+    (if (i32.eq (global.get $mode) (i32.const 3))
+      (then
+        (local.set $ld (local.get $di))
+        (local.set $ls (local.get $si))
+        (if (i32.ge_u (local.get $seg) (i32.const 4))
+          (then (local.set $ls (i64.add (local.get $ls) (call $seg_base (local.get $seg)))))))
+      (else
+        (local.set $ld (i64.and (i64.add (call $seg_base (i32.const 0)) (local.get $di))
+                                (i64.const 0xFFFFFFFF)))
+        (local.set $ls (i64.and (i64.add (call $seg_base (local.get $seg)) (local.get $si))
+                                (i64.const 0xFFFFFFFF)))))
+
+    ;; how many elements: the count, then what fits before either address
+    ;; leaves its page, then before either offset wraps
+    (local.set $k (local.get $n))
+    (local.set $room (i64.div_u (i64.sub (i64.const 4096) (i64.and (local.get $ld) (i64.const 4095)))
+                                (local.get $sz)))
+    (if (i64.lt_u (local.get $room) (local.get $k)) (then (local.set $k (local.get $room))))
+    (if (local.get $movs)
+      (then
+        (local.set $room (i64.div_u (i64.sub (i64.const 4096) (i64.and (local.get $ls) (i64.const 4095)))
+                                    (local.get $sz)))
+        (if (i64.lt_u (local.get $room) (local.get $k)) (then (local.set $k (local.get $room))))))
+    (if (i32.ne (local.get $as) (i32.const 8))
+      (then
+        (local.set $room (i64.div_u (i64.sub (i64.add (local.get $amask) (i64.const 1)) (local.get $di))
+                                    (local.get $sz)))
+        (if (i64.lt_u (local.get $room) (local.get $k)) (then (local.set $k (local.get $room))))
+        (if (local.get $movs)
+          (then
+            (local.set $room (i64.div_u (i64.sub (i64.add (local.get $amask) (i64.const 1)) (local.get $si))
+                                        (local.get $sz)))
+            (if (i64.lt_u (local.get $room) (local.get $k)) (then (local.set $k (local.get $room))))))))
+    (if (i64.eqz (local.get $k)) (then (return)))
+    (local.set $bytes (i64.mul (local.get $k) (local.get $sz)))
+
+    ;; segment limits, in protected mode, through the fast limits
+    (if (i32.and (i32.ne (global.get $mode) (i32.const 0)) (i32.ne (global.get $mode) (i32.const 3)))
+      (then
+        (if (i64.gt_s (i64.sub (i64.add (local.get $di) (local.get $bytes)) (i64.const 1))
+                      (i64.load (i32.const 0x1C0)))
+          (then (return)))
+        (if (local.get $movs)
+          (then
+            (if (i64.gt_s (i64.sub (i64.add (local.get $si) (local.get $bytes)) (i64.const 1))
+                          (i64.load (i32.add (i32.const 0x1C0) (i32.shl (local.get $seg) (i32.const 3)))))
+              (then (return)))))))
+
+    ;; both pages must already be in the JIT TLB
+    (local.set $slot (i32.add (global.get $JTLB_W) (call $jtlb_slot (local.get $ld))))
+    (if (i64.ne (i64.load (local.get $slot))
+                (i64.or (i64.and (local.get $ld) (i64.const -4096)) (i64.extend_i32_u (global.get $jtlb_bits))))
+      (then (return)))
+    (local.set $pd (i64.add (local.get $ld) (i64.load offset=8 (local.get $slot))))
+    (if (local.get $movs)
+      (then
+        (local.set $slot (i32.add (global.get $JTLB_R) (call $jtlb_slot (local.get $ls))))
+        (if (i64.ne (i64.load (local.get $slot))
+                    (i64.or (i64.and (local.get $ls) (i64.const -4096)) (i64.extend_i32_u (global.get $jtlb_bits))))
+          (then (return)))
+        (local.set $ps (i64.add (local.get $ls) (i64.load offset=8 (local.get $slot))))))
+
+    (if (local.get $movs)
+      (then
+        ;; memory.copy is memmove; x86 copies forward an element at a time, so
+        ;; a destination just above an overlapping source repeats a pattern
+        ;; instead.  Only that case needs the loop.
+        (if (i32.and (i64.gt_u (local.get $pd) (local.get $ps))
+                     (i64.lt_u (local.get $pd) (i64.add (local.get $ps) (local.get $bytes))))
+          (then
+            (local.set $i (i64.const 0))
+            (block $e (loop $l
+              (br_if $e (i64.ge_u (local.get $i) (local.get $bytes)))
+              (call $ram_store (i64.add (local.get $pd) (local.get $i)) (local.get $size)
+                    (call $ram_load (i64.add (local.get $ps) (local.get $i)) (local.get $size)))
+              (local.set $i (i64.add (local.get $i) (local.get $sz)))
+              (br $l))))
+          (else (memory.copy $ram $ram (local.get $pd) (local.get $ps) (local.get $bytes))))
+        (call $setregN (i32.const 6) (local.get $as) (i64.add (local.get $si) (local.get $bytes))))
+      (else
+        (local.set $v (call $regN (i32.const 0) (local.get $size)))
+        (if (i32.eq (local.get $size) (i32.const 1))
+          (then (memory.fill $ram (local.get $pd) (i32.wrap_i64 (local.get $v)) (local.get $bytes)))
+          (else
+            (local.set $i (i64.const 0))
+            (block $e (loop $l
+              (br_if $e (i64.ge_u (local.get $i) (local.get $bytes)))
+              (call $ram_store (i64.add (local.get $pd) (local.get $i)) (local.get $size) (local.get $v))
+              (local.set $i (i64.add (local.get $i) (local.get $sz)))
+              (br $l)))))))
+    (call $setregN (i32.const 7) (local.get $as) (i64.add (local.get $di) (local.get $bytes)))
+    (call $setregN (i32.const 1) (local.get $as) (i64.sub (local.get $n) (local.get $k))))
 
   ;; INS / OUTS
   (func $h_ins_outs (param $op i32)
@@ -414,6 +545,7 @@
       (then
         (call $seg_write (i32.const 0) (call $regN (i32.const 7) (global.get $addrsize))
               (local.get $size)
+              (call $io_mark)
               (i64.extend_i32_u (call $io_read (local.get $port) (local.get $size))))
         (if (global.get $fault) (then (return)))
         (call $adv_si_di (i32.const 2) (local.get $size)))
@@ -423,7 +555,8 @@
         (local.set $v (call $seg_read (local.get $seg)
                         (call $regN (i32.const 6) (global.get $addrsize)) (local.get $size)))
         (if (global.get $fault) (then (return)))
-        (call $io_write (local.get $port) (local.get $size) (i32.wrap_i64 (local.get $v)))
+        (global.set $jit_exit (i32.const 1))
+             (call $io_write (local.get $port) (local.get $size) (i32.wrap_i64 (local.get $v)))
         (call $adv_si_di (i32.const 1) (local.get $size))))
     (if (global.get $rep)
       (then
@@ -431,4 +564,4 @@
               (i64.sub (call $regN (i32.const 1) (global.get $addrsize)) (i64.const 1)))
         (if (i64.ne (call $trunc (call $regN (i32.const 1) (global.get $addrsize))
                                  (global.get $addrsize)) (i64.const 0))
-          (then (call $set_rip (global.get $rip0)))))))
+          (then (global.set $rip_g (global.get $rip0)))))))
